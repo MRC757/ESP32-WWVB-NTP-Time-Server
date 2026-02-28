@@ -220,7 +220,7 @@ uint8_t ES100::readRegister(uint8_t reg) {
     
     _wire->beginTransmission(ES100_I2C_ADDR);
     _wire->write(reg);
-    if (_wire->endTransmission(false) != 0) {  // Send repeated start
+    if (_wire->endTransmission(true) != 0) {  // Send STOP, then re-START for read
         Serial.printf("I2C error writing register address 0x%02X\n", reg);
         return 0xFF;
     }
@@ -259,7 +259,7 @@ uint8_t ES100::readRegisters(uint8_t startReg, uint8_t *buffer, uint8_t count) {
     
     _wire->beginTransmission(ES100_I2C_ADDR);
     _wire->write(startReg);
-    if (_wire->endTransmission(false) != 0) {  // Send repeated start
+    if (_wire->endTransmission(true) != 0) {  // Send STOP, then re-START for read
         Serial.printf("I2C error writing start register 0x%02X\n", startReg);
         return 0;
     }

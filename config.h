@@ -98,24 +98,23 @@
 // declared in wwvb_clock.ino.
 //
 // Dual I2C Bus Architecture:
-//   Wire  (bus 0, 400 kHz): GPIO2/3  — touch panel, PMU, DS3231 RTC
-//   Wire1 (bus 1, 100 kHz): GPIO15/16 — ES100 WWVB receiver (isolated)
+//   Wire  (bus 0, 400 kHz): GPIO2/3  — touch panel, PMU, ES100 WWVB receiver
+//   Wire1 (bus 1, 100 kHz): GPIO15/16 — DS3231 RTC
 //
-// Isolating the ES100 on its own bus prevents I2C contention with the
-// touch controller and PMU during reception.
+// ES100 is on Wire (bus 0) which has pull-up resistors via the STEMMA QT connector.
 // ============================================================================
 
-// I2C Bus 0 (Wire) — touch, PMU, DS3231 (STEMMA QT connector)
+// I2C Bus 0 (Wire) — touch, PMU, ES100 WWVB receiver (STEMMA QT connector)
 #define PIN_I2C_SDA         3
 #define PIN_I2C_SCL         2
 
-// I2C Bus 1 (Wire1) — ES100 WWVB receiver (isolated bus)
+// I2C Bus 1 (Wire1) — DS3231 RTC
 #define PIN_ES100_SDA       15
 #define PIN_ES100_SCL       16
 
 // ES100 control pins
-#define PIN_ES100_EN        13    // ES100 Enable (power control)
-#define PIN_ES100_IRQ       14    // ES100 IRQ (active low, interrupt)
+#define PIN_ES100_EN        40    // ES100 Enable (power control)
+#define PIN_ES100_IRQ       41    // ES100 IRQ (active low, interrupt)
 
 // Touch panel interrupt — handled by LilyGo library
 #define PIN_TOUCH_INT       21

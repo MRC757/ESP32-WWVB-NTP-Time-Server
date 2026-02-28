@@ -38,12 +38,12 @@
 // ============================================================================
 // Pin Definitions for LilyGo T-Display-S3 AMOLED
 // ============================================================================
-#define I2C_SDA_PIN         3       // Wire bus 0: touch, PMU, DS3231
+#define I2C_SDA_PIN         3       // Wire bus 0: touch, PMU, ES100
 #define I2C_SCL_PIN         2
-#define ES100_SDA_PIN       15      // Wire1 bus 1: ES100 only (isolated)
+#define ES100_SDA_PIN       15      // Wire1 bus 1: DS3231 RTC
 #define ES100_SCL_PIN       16
-#define ES100_EN_PIN        13
-#define ES100_IRQ_PIN       14
+#define ES100_EN_PIN        40
+#define ES100_IRQ_PIN       41
 
 // ============================================================================
 // Display Objects - LilyGo AMOLED + TFT_eSPI Sprite
@@ -1790,15 +1790,15 @@ bool initializeDS3231() {
     Serial.println("Attempting DS3231 RTC initialization...");
 
     // First verify a device responds at DS3231 address (0x68)
-    Wire.beginTransmission(0x68);
-    uint8_t i2cError = Wire.endTransmission();
+    Wire1.beginTransmission(0x68);
+    uint8_t i2cError = Wire1.endTransmission();
     if (i2cError != 0) {
         Serial.printf("DS3231 not found at I2C address 0x68 (error: %d)\n", i2cError);
         rtcAvailable = false;
         return false;
     }
 
-    if (!rtc.begin(&Wire)) {
+    if (!rtc.begin(&Wire1)) {
         Serial.println("DS3231 library initialization failed");
         rtcAvailable = false;
         return false;
@@ -1991,7 +1991,7 @@ bool ntpClientSync() {
 bool initializeES100() {
     Serial.println("Attempting ES100 initialization...");
 
-    if (es100.begin(&Wire1, ES100_SDA_PIN, ES100_SCL_PIN)) {
+    if (es100.begin(&Wire, I2C_SDA_PIN, I2C_SCL_PIN)) {
         Serial.println("ES100 initialized successfully");
         es100Available = true;
         es100InitRetries = 0;  // Reset retry counter on success
@@ -2287,26 +2287,35 @@ void setup() {
     Serial.printf("[BOOT] Free heap: %d bytes\n", ESP.getFreeHeap());
     Serial.printf("[BOOT] PSRAM: %s\n", psramFound() ? "Found" : "Not found");
 
-    // Initialize I2C bus 0 (touch, PMU, DS3231) - 400kHz fast mode
+    // Initialize I2C bus 0 (touch, PMU, ES100) - 400kHz fast mode
     Serial.println("[BOOT] Initializing I2C...");
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(400000);
-    Serial.println("[BOOT] Wire initialized (400kHz) - touch, PMU, DS3231");
+    Serial.println("[BOOT] Wire initialized (400kHz) - touch, PMU, ES100 on GPIO 2/3");
 
-    // Initialize I2C bus 1 (ES100 only) - 100kHz standard mode, isolated from touch
+    // Initialize I2C bus 1 (DS3231 RTC) - 100kHz standard mode
     Wire1.begin(ES100_SDA_PIN, ES100_SCL_PIN);
     Wire1.setClock(100000);
-    Serial.println("[BOOT] Wire1 initialized (100kHz) - ES100 on GPIO 15/16");
+    Serial.println("[BOOT] Wire1 initialized (100kHz) - DS3231 on GPIO 15/16");
 
-    // I2C bus scan on Wire1
+    // I2C bus scan on both buses
+    // Note: ES100 (0x32) will NOT appear here — it only responds when EN is HIGH,
+    // and EN is not driven until initializeES100() is called later in the main loop.
+    Serial.println("[BOOT] Scanning Wire for devices...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("[BOOT] Wire found device at 0x%02X\n", addr);
+        }
+    }
     Serial.println("[BOOT] Scanning Wire1 for devices...");
     for (uint8_t addr = 1; addr < 127; addr++) {
         Wire1.beginTransmission(addr);
         if (Wire1.endTransmission() == 0) {
-            Serial.printf("[BOOT] Found device at 0x%02X\n", addr);
+            Serial.printf("[BOOT] Wire1 found device at 0x%02X\n", addr);
         }
     }
-    Serial.println("[BOOT] Wire1 scan complete");
+    Serial.println("[BOOT] I2C scan complete");
 
     // Initialize DS3231 RTC
     Serial.println("[BOOT] Initializing DS3231 RTC...");
