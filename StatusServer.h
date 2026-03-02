@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <functional>
 #include "config.h"
 #include "TimeManager.h"
 #include "NTPServer.h"
@@ -30,6 +31,10 @@ struct StatusData {
     bool     batteryCharging;    // True if USB charging
     uint8_t  timeSource;         // 0=None, 1=RTC, 2=NTP, 3=WWVB
     unsigned long lastSyncMillis; // millis() of last time sync (0 = never)
+    bool     es100Available;     // ES100 hardware initialized
+    bool     es100Receiving;     // ES100 currently receiving WWVB signal
+    bool     es100Tracking;      // Current receive attempt is tracking mode (vs normal)
+    char     lastSyncTimeStr[20]; // "YYYY-MM-DD HH:MM:SS" UTC of last sync, "" if never
 };
 
 class StatusServer {
@@ -73,6 +78,11 @@ public:
     void setReceptionHistory(ReceptionHistory* rh);
 
     /**
+     * @brief Set callback invoked when the browser requests a manual WWVB sync
+     */
+    void setOnSyncRequest(std::function<void()> cb);
+
+    /**
      * @brief Check if server is running
      */
     bool isRunning() const;
@@ -85,8 +95,11 @@ private:
     StatusData* _statusData;
     ReceptionHistory* _receptionHistory;
 
+    std::function<void()> _onSyncRequest;
+
     void handleRoot();
     void handleApiStatus();
+    void handleApiSync();
     void handleNotFound();
     String buildPage();
     const char* timeSourceName(uint8_t src);

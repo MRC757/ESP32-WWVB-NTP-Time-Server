@@ -59,8 +59,13 @@
 #define SYNC_NIGHT_START_HOUR      22   // 10 PM local
 #define SYNC_NIGHT_END_HOUR        6    // 6 AM local
 
-// Consecutive daytime failures before skipping until nighttime
+// Consecutive daytime normal-mode failures before skipping until nighttime
 #define SYNC_DAY_MAX_FAILURES      3
+
+// Consecutive daytime tracking-mode failures before skipping until nighttime.
+// Tracking attempts cost only ~10 s vs ~134 s for normal mode, so a higher
+// threshold is acceptable without meaningfully increasing wasted time.
+#define SYNC_DAY_MAX_TRACKING_FAILURES  12
 
 // Maximum time for a sync attempt before timeout (milliseconds)
 // Normal mode: 3 minutes (ES100 1-minute frame + antenna toggle retry)
@@ -98,17 +103,18 @@
 // declared in wwvb_clock.ino.
 //
 // Dual I2C Bus Architecture:
-//   Wire  (bus 0, 400 kHz): GPIO2/3  — touch panel, PMU, ES100 WWVB receiver
-//   Wire1 (bus 1, 100 kHz): GPIO15/16 — DS3231 RTC
+//   Wire  (bus 0, 400 kHz): GPIO2/3   — touch panel, PMU, DS3231 RTC
+//   Wire1 (bus 1, 100 kHz): GPIO15/16 — ES100 WWVB receiver (isolated)
 //
-// ES100 is on Wire (bus 0) which has pull-up resistors via the STEMMA QT connector.
+// ES100 is isolated on Wire1 to prevent I2C contention with the touch controller
+// and PMU during WWVB frame reception. Enable pull-up resistors on the ES100 module.
 // ============================================================================
 
-// I2C Bus 0 (Wire) — touch, PMU, ES100 WWVB receiver (STEMMA QT connector)
+// I2C Bus 0 (Wire) — touch, PMU, DS3231 RTC (STEMMA QT connector)
 #define PIN_I2C_SDA         3
 #define PIN_I2C_SCL         2
 
-// I2C Bus 1 (Wire1) — DS3231 RTC
+// I2C Bus 1 (Wire1) — ES100 WWVB receiver (isolated)
 #define PIN_ES100_SDA       15
 #define PIN_ES100_SCL       16
 
@@ -129,9 +135,17 @@
 // The ES100 will toggle between antennas on failed attempts
 #define ES100_START_ANT1      true
 
-// Use tracking mode for periodic drift adjustments (advanced)
-// Requires precise timing - leave false unless you understand the implications
-#define ES100_USE_TRACKING    false
+// Use tracking mode for periodic drift adjustments after a successful normal-mode sync.
+// Tracking mode completes in ~10 s vs ~134 s for normal mode, and is sufficient when
+// the RTC holds time to within ~1 s/week between syncs.
+#define ES100_USE_TRACKING    true
+
+// How long to persist tracking mode through consecutive failures before falling back
+// to a full normal-mode sync. If the signal is too weak for 10-second tracking, it is
+// also too weak for 134-second normal mode. The DS3231 drifts ~173 µs/day (2 ppm max);
+// 30 s of drift would take ~174 days, so 7 days (~1.2 ms total drift) is well within
+// the tracking mode tolerance.
+#define ES100_TRACKING_FALLBACK_MS  604800000UL  // 7 days
 
 // ============================================================================
 // DEBUG CONFIGURATION
@@ -206,6 +220,10 @@
 
 // Low battery alert threshold (percentage, 0-100)
 #define LOW_BATTERY_THRESHOLD   10
+
+// Critical battery threshold — forces deep sleep to protect NVS
+// Battery will not charge below ~3.0V; shutting down at 5% prevents corruption
+#define CRITICAL_BATTERY_THRESHOLD  5
 
 // Low battery serial warning interval (milliseconds)
 #define LOW_BATTERY_WARN_MS     60000

@@ -40,7 +40,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **ES100 Power Control**: ES100 is powered down between sync attempts (~0.1 µA off vs. ~8 mA receiving)
 - **Deep Sleep Shutdown**: Hold the screen for 10 seconds to enter deep sleep; wake with a tap (GPIO21)
 - **Battery Monitoring**: LiPo voltage and charge-state read from the LilyGo PMU; low-battery alert at 10%
-- **Dual I2C Bus**: DS3231 RTC on Wire1 (GPIO15/16); ES100 shares Wire (GPIO2/3) with the touch panel and PMU using the STEMMA QT pull-up resistors
+- **Dual I2C Bus**: ES100 isolated on Wire1 (GPIO15/16) to prevent I2C contention with the touch panel and PMU during WWVB reception; DS3231 on Wire (GPIO2/3)
 
 ## Hardware Requirements
 
@@ -57,31 +57,35 @@ The ES100 module typically requires an external 16 MHz crystal — check your sp
 
 ### Wiring
 
-#### I2C Bus 0 — Wire (GPIO2/3): Touch, PMU, ES100
-
-| ES100 Pin | ESP32-S3 Pin | Notes |
-|-----------|--------------|-------|
-| VDD | 3.3V | |
-| GND | GND | |
-| SDA | GPIO3 | STEMMA QT connector |
-| SCL | GPIO2 | STEMMA QT connector |
-| EN | GPIO40 | Enable / power control |
-| IRQ- | GPIO41 | Interrupt (active low) |
-| ANT1P/ANT1N | Antenna 1 | First ferrite antenna |
-| ANT2P/ANT2N | Antenna 2 | Second ferrite antenna (optional) |
-
-The touch panel and PMU are connected to this same bus by the LilyGo board internally. **Enable the ES100 module's on-board pull-up resistors** — the STEMMA QT connector provides pull-ups on SDA/SCL.
-
-> **Pin conflict warning:** On the LilyGo T-Display-S3 AMOLED, GPIO9–GPIO14 are used by the QSPI display interface (FSPIHD, FSPICS0, FSPID, FSPICLK, FSPIQ, FSPIWP). Do not connect ES100 EN or IRQ to any of those pins — they will not work as GPIO.
-
-#### I2C Bus 1 — Wire1 (GPIO15/16): DS3231
+#### I2C Bus 0 — Wire (GPIO2/3): Touch, PMU, DS3231
 
 | DS3231 Pin | ESP32-S3 Pin | Notes |
 |------------|--------------|-------|
 | VCC | 3.3V | |
 | GND | GND | |
-| SDA | GPIO15 | Wire1 |
-| SCL | GPIO16 | Wire1 |
+| SDA | GPIO3 | STEMMA QT connector |
+| SCL | GPIO2 | STEMMA QT connector |
+
+The touch panel and PMU are connected to this same bus by the LilyGo board internally.
+
+#### I2C Bus 1 — Wire1 (GPIO15/16): ES100 (isolated)
+
+The ES100 is on its own dedicated I2C bus to prevent contention with the touch controller and PMU during WWVB frame reception. **Enable the pull-up resistors on the ES100 module** — GPIO15/16 have no external pull-ups.
+
+> **Pin conflict warning:** On the LilyGo T-Display-S3 AMOLED, GPIO9–GPIO14 are used by the QSPI display interface (FSPIHD, FSPICS0, FSPID, FSPICLK, FSPIQ, FSPIWP). Do not connect ES100 EN or IRQ to any of those pins — they will not work as GPIO.
+
+```
+ES100 Pin    →    ESP32-S3 Pin    Description
+──────────────────────────────────────────────────
+VDD          →    3.3V            Power supply
+GND          →    GND             Ground
+SDA          →    GPIO15          ES100 I2C Data (Wire1)
+SCL          →    GPIO16          ES100 I2C Clock (Wire1)
+EN           →    GPIO40          Enable / power control
+IRQ-         →    GPIO41          Interrupt (active low)
+ANT1P/ANT1N  →    Antenna 1       First ferrite antenna
+ANT2P/ANT2N  →    Antenna 2       Second ferrite antenna (optional)
+```
 
 ## Software Setup
 
@@ -165,10 +169,10 @@ Pins are documented in `config.h` for reference and defined as local constants i
 
 | Signal | GPIO | Bus |
 |--------|------|-----|
-| I2C SDA (touch, PMU, ES100) | 3 | Wire (bus 0) |
-| I2C SCL (touch, PMU, ES100) | 2 | Wire (bus 0) |
-| DS3231 SDA | 15 | Wire1 (bus 1) |
-| DS3231 SCL | 16 | Wire1 (bus 1) |
+| I2C SDA (touch, PMU, DS3231) | 3 | Wire (bus 0) |
+| I2C SCL (touch, PMU, DS3231) | 2 | Wire (bus 0) |
+| ES100 SDA | 15 | Wire1 (bus 1) |
+| ES100 SCL | 16 | Wire1 (bus 1) |
 | ES100 EN | 40 | — |
 | ES100 IRQ | 41 | — |
 | Touch INT | 21 | — |
@@ -180,7 +184,7 @@ Pins are documented in `config.h` for reference and defined as local constants i
 1. Display initializes (LilyGo AMOLED auto-detects board variant)
 2. DS3231 RTC checked — if present, time is loaded from RTC immediately
 3. Saved WiFi credentials loaded; connection attempt begins if credentials exist
-4. ES100 detected and verified on Wire (bus 0); first WWVB sync attempt starts
+4. ES100 detected and verified on Wire1 (bus 1, isolated); first WWVB sync attempt starts
 5. Clock displays running time from the best available source
 
 ### Touch Interface
@@ -265,9 +269,9 @@ The bar chart shows successful WWVB receptions over the past 48 hours:
 
 ### "ES100: FAILED" at startup
 
-- Check Wire wiring: SDA→GPIO3, SCL→GPIO2 (STEMMA QT connector)
+- Check Wire1 wiring: SDA→GPIO15, SCL→GPIO16
 - Check EN→GPIO40 and IRQ→GPIO41
-- **Enable the pull-up resistors on the ES100 module** — the ES100 will not respond on I2C without them
+- **Enable the pull-up resistors on the ES100 module** — GPIO15/16 have no external pull-ups; the ES100 will not respond on I2C without them
 - Verify 3.3V power to the ES100 module
 - Make sure the ES100 has the required 16 MHz crystal
 - **Do not use GPIO9–GPIO14 for EN or IRQ** — these are QSPI display pins (FSPIQ, FSPIWP, etc.) on the LilyGo AMOLED and cannot be used as GPIO
@@ -325,10 +329,10 @@ Normal behavior. The ESP32-S3 crystal has ~20 ppm accuracy. The DS3231 RTC has ~
 Wire  (bus 0, 400 kHz, GPIO2/3):
   ├── CST816T  — Capacitive touch (0x15)
   ├── AXP2101  — PMU / battery (0x34)
-  └── ES100    — WWVB receiver (0x32)
+  └── DS3231   — RTC (0x68)
 
 Wire1 (bus 1, 100 kHz, GPIO15/16):
-  └── DS3231   — RTC (0x68)
+  └── ES100    — WWVB receiver (0x32)  ← isolated to prevent contention
 ```
 
 > **I2C note:** The ES100 requires a STOP condition between the register-address write and the data read (no repeated start). This differs from many I2C devices. The driver uses `endTransmission(true)` for all ES100 reads.

@@ -1,0 +1,52 @@
+// Simple display test - rename to .ino and upload to test display
+#include <LilyGo_AMOLED.h>
+#include <TFT_eSPI.h>
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+LilyGo_Class amoled;
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("Display Test Starting...");
+
+    if (!amoled.begin()) {
+        Serial.println("AMOLED init failed!");
+        while(1) delay(100);
+    }
+
+    Serial.printf("Display: %d x %d\n", amoled.width(), amoled.height());
+    amoled.setBrightness(200);
+
+    sprite.createSprite(amoled.width(), amoled.height());
+    sprite.setSwapBytes(true);
+
+    // Test 1: Fill screen with red
+    Serial.println("Test 1: Red screen");
+    sprite.fillSprite(TFT_RED);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(), (uint16_t *)sprite.getPointer());
+    delay(2000);
+
+    // Test 2: Fill screen with green
+    Serial.println("Test 2: Green screen");
+    sprite.fillSprite(TFT_GREEN);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(), (uint16_t *)sprite.getPointer());
+    delay(2000);
+
+    // Test 3: Blue with text
+    Serial.println("Test 3: Blue with white text");
+    sprite.fillSprite(TFT_BLUE);
+    sprite.setTextColor(TFT_WHITE);
+    sprite.setTextSize(3);
+    sprite.setCursor(10, 100);
+    sprite.println("Display Test");
+    sprite.println("Working!");
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(), (uint16_t *)sprite.getPointer());
+
+    Serial.println("Display test complete!");
+}
+
+void loop() {
+    delay(1000);
+}

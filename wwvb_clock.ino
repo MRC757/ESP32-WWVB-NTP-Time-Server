@@ -38,9 +38,9 @@
 // ============================================================================
 // Pin Definitions for LilyGo T-Display-S3 AMOLED
 // ============================================================================
-#define I2C_SDA_PIN         3       // Wire bus 0: touch, PMU, ES100
+#define I2C_SDA_PIN         3       // Wire bus 0: touch, PMU, DS3231
 #define I2C_SCL_PIN         2
-#define ES100_SDA_PIN       15      // Wire1 bus 1: DS3231 RTC
+#define ES100_SDA_PIN       15      // Wire1 bus 1: ES100 (isolated)
 #define ES100_SCL_PIN       16
 #define ES100_EN_PIN        40
 #define ES100_IRQ_PIN       41
@@ -71,8 +71,9 @@ Preferences preferences;
 volatile bool es100InterruptFlag = false;
 bool es100Receiving = false;
 bool es100Available = false;
-bool es100TrackingReady = false;   // True after a successful normal-mode decode
-bool es100UsingTracking = false;   // True if current attempt is tracking mode
+bool es100TrackingReady = false;        // True after a successful normal-mode decode
+bool es100UsingTracking = false;        // True if current attempt is tracking mode
+unsigned long es100TrackingReadySinceMs = 0; // millis() when es100TrackingReady was last set
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastSyncAttempt = 0;
 uint8_t daytimeFailures = 0;          // Consecutive daytime sync failures
@@ -95,6 +96,7 @@ unsigned long lastTempRead = 0;  // millis() of last temperature read
 // Low battery tracking
 bool lowBatteryAlerted = false;         // True once 10% alert has been triggered
 unsigned long lastLowBattWarn = 0;      // millis() of last serial warning
+uint8_t critBattCount = 0;              // Consecutive critical-battery readings (debounce)
 
 // Time source tracking
 enum TimeSource { TIME_SRC_NONE, TIME_SRC_RTC, TIME_SRC_NTP, TIME_SRC_WWVB };
@@ -445,14 +447,11 @@ void drawSyncStatus() {
     int totalSuccess = receptionHistory.getTotalSuccessCount();
     int total48h = receptionHistory.getRecentSuccessCount();
     
-    if (!es100Available && es100InitRetries < MAX_ES100_INIT_RETRIES) {
-        snprintf(statusStr, sizeof(statusStr), "ES100 INIT RETRY %d/%d", es100InitRetries, MAX_ES100_INIT_RETRIES);
+    if (!es100Available) {
+        snprintf(statusStr, sizeof(statusStr), "ES100 RETRY %d", es100InitRetries);
         statusColor = COLOR_SYNC_PENDING;
-    } else if (!es100Available) {
-        snprintf(statusStr, sizeof(statusStr), "ES100 UNAVAILABLE");
-        statusColor = COLOR_SYNC_FAIL;
     } else if (es100Receiving) {
-        snprintf(statusStr, sizeof(statusStr), "SYNCING...");
+        snprintf(statusStr, sizeof(statusStr), es100UsingTracking ? "TRACKING..." : "SYNCING...");
         statusColor = COLOR_SYNC_PENDING;
     } else if (lastSync == 0) {
         snprintf(statusStr, sizeof(statusStr), "NO SYNC YET");
@@ -883,6 +882,11 @@ void wifiCheckConnection() {
             statusServer.setNTPServer(&ntpServer);
             statusServer.setStatusData(&statusData);
             statusServer.setReceptionHistory(&receptionHistory);
+            statusServer.setOnSyncRequest([]() {
+                daytimeSkipActive = false;
+                daytimeFailures = 0;
+                if (!es100Receiving) startWWVBSync();
+            });
             statusServer.begin();
         }
 
@@ -1735,6 +1739,13 @@ void saveTimeToPreferences() {
     preferences.putBool("dst", dstActive);
     preferences.putULong("saveMillis", millis());
 
+    // Persist tracking state so the 7-day window survives reboots.
+    // Save the elapsed age (ms since tracking was established); restored on load
+    // by reconstructing the reference point with unsigned arithmetic.
+    preferences.putBool("trkReady", es100TrackingReady);
+    unsigned long trkAge = es100TrackingReady ? (millis() - es100TrackingReadySinceMs) : 0xFFFFFFFFUL;
+    preferences.putULong("trkAge", trkAge);
+
     preferences.end();
     Serial.println("Time saved to preferences");
 }
@@ -1757,8 +1768,19 @@ bool loadTimeFromPreferences() {
     uint8_t second = preferences.getUChar("second", 0);
     dstActive = preferences.getBool("dst", false);
     unsigned long saveMillis = preferences.getULong("saveMillis", 0);
+    bool savedTrkReady = preferences.getBool("trkReady", false);
+    unsigned long savedTrkAge = preferences.getULong("trkAge", 0xFFFFFFFFUL);
 
     preferences.end();
+
+    // Restore tracking state if it was active and the 7-day window hasn't expired.
+    // Unsigned subtraction reconstructs the original reference point correctly.
+    if (savedTrkReady && savedTrkAge < ES100_TRACKING_FALLBACK_MS) {
+        es100TrackingReady = true;
+        es100TrackingReadySinceMs = millis() - savedTrkAge;
+        Serial.printf("Tracking state restored (age: %lu ms, %lu ms remaining)\n",
+                     savedTrkAge, ES100_TRACKING_FALLBACK_MS - savedTrkAge);
+    }
 
     // Set the time
     timeManager.setTime(year, month, day, hour, minute, second);
@@ -1790,15 +1812,15 @@ bool initializeDS3231() {
     Serial.println("Attempting DS3231 RTC initialization...");
 
     // First verify a device responds at DS3231 address (0x68)
-    Wire1.beginTransmission(0x68);
-    uint8_t i2cError = Wire1.endTransmission();
+    Wire.beginTransmission(0x68);
+    uint8_t i2cError = Wire.endTransmission();
     if (i2cError != 0) {
         Serial.printf("DS3231 not found at I2C address 0x68 (error: %d)\n", i2cError);
         rtcAvailable = false;
         return false;
     }
 
-    if (!rtc.begin(&Wire1)) {
+    if (!rtc.begin(&Wire)) {
         Serial.println("DS3231 library initialization failed");
         rtcAvailable = false;
         return false;
@@ -1843,6 +1865,7 @@ bool loadTimeFromDS3231() {
     if (lastTimeSource == TIME_SRC_NONE) {
         lastTimeSource = TIME_SRC_RTC;
         lastTimeSyncMillis = millis();
+        snapshotSyncTime();
     }
 
     return true;
@@ -1973,6 +1996,7 @@ bool ntpClientSync() {
     // RFC 5905: Stratum 2+ reference ID = upstream server's IPv4 address
     lastTimeSource = TIME_SRC_NTP;
     lastTimeSyncMillis = millis();
+    snapshotSyncTime();
     ntpServer.setStratum(2, ntpServerIP);
 
     // Recompute DST from calendar after NTP time update
@@ -1986,27 +2010,39 @@ bool ntpClientSync() {
 }
 
 // ============================================================================
+// Sync Time Snapshot
+// ============================================================================
+// Records the current UTC time as a formatted string in statusData.lastSyncTimeStr.
+// Call immediately after setting lastTimeSyncMillis at each sync point.
+void snapshotSyncTime() {
+    ClockTime utc = timeManager.getUTCTime();
+    snprintf(statusData.lastSyncTimeStr, sizeof(statusData.lastSyncTimeStr),
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second);
+}
+
+// ============================================================================
 // ES100 Initialization Functions
 // ============================================================================
 bool initializeES100() {
     Serial.println("Attempting ES100 initialization...");
 
-    if (es100.begin(&Wire, I2C_SDA_PIN, I2C_SCL_PIN)) {
+    if (es100.begin(&Wire1, ES100_SDA_PIN, ES100_SCL_PIN)) {
         Serial.println("ES100 initialized successfully");
         es100Available = true;
         es100InitRetries = 0;  // Reset retry counter on success
         return true;
     } else {
-        Serial.printf("ES100 initialization failed (attempt %d/%d)\n",
-                     es100InitRetries + 1, MAX_ES100_INIT_RETRIES);
+        Serial.printf("ES100 initialization failed (attempt %d, will retry)\n",
+                     es100InitRetries + 1);
         es100Available = false;
         return false;
     }
 }
 
 bool retryES100Initialization() {
-    if (es100Available || es100InitRetries >= MAX_ES100_INIT_RETRIES) {
-        return false;  // Already initialized or max retries reached
+    if (es100Available) {
+        return false;  // Already initialized
     }
 
     unsigned long now = millis();
@@ -2106,15 +2142,16 @@ unsigned long getSyncInterval() {
 /**
  * @brief Record a sync failure and activate daytime backoff if threshold reached
  */
-void recordSyncFailure() {
+void recordSyncFailure(bool wasTracking = false) {
     receptionHistory.recordAttempt(false);
 
     if (!isNighttimeWindow()) {
+        uint8_t threshold = wasTracking ? SYNC_DAY_MAX_TRACKING_FAILURES : SYNC_DAY_MAX_FAILURES;
         daytimeFailures++;
-        if (daytimeFailures >= SYNC_DAY_MAX_FAILURES) {
+        if (daytimeFailures >= threshold) {
             daytimeSkipActive = true;
-            Serial.printf("[SYNC] %d consecutive daytime failures — skipping until nighttime\n",
-                         daytimeFailures);
+            Serial.printf("[SYNC] %d consecutive daytime %s failures — skipping until nighttime\n",
+                         daytimeFailures, wasTracking ? "tracking" : "normal");
         }
     }
 }
@@ -2133,11 +2170,18 @@ void startWWVBSync() {
     uint8_t mode = ES100_CTRL0_NORMAL;
     es100UsingTracking = false;
 
-    if (es100TrackingReady) {
-        mode = ES100_CTRL0_NORMAL | ES100_CTRL0_TRACKING;  // 0x11
-        es100UsingTracking = true;
-        Serial.println("Starting WWVB tracking mode sync...");
-    } else {
+    if (ES100_USE_TRACKING && es100TrackingReady) {
+        if (millis() - es100TrackingReadySinceMs >= ES100_TRACKING_FALLBACK_MS) {
+            // 24 hours without a successful sync — do a full normal-mode decode
+            Serial.println("Tracking mode expired (24h without sync), switching to normal mode");
+            es100TrackingReady = false;
+        } else {
+            mode = ES100_CTRL0_NORMAL | ES100_CTRL0_TRACKING;  // 0x11
+            es100UsingTracking = true;
+            Serial.println("Starting WWVB tracking mode sync...");
+        }
+    }
+    if (!es100UsingTracking) {
         Serial.println("Starting WWVB normal mode sync...");
     }
 
@@ -2202,10 +2246,13 @@ void handleES100Interrupt() {
                 // Track time source
                 lastTimeSource = TIME_SRC_WWVB;
                 lastTimeSyncMillis = millis();
+                snapshotSyncTime();
                 ntpServer.setStratum(1, "WWVB");
 
-                // Enable tracking mode for subsequent hourly syncs
+                // Enable tracking mode for subsequent syncs; record when it was set
+                // so the 24-hour fallback timer in startWWVBSync() has a reference point.
                 es100TrackingReady = true;
+                es100TrackingReadySinceMs = millis();
 
                 // Reset daytime failure tracking on any successful sync
                 daytimeFailures = 0;
@@ -2219,23 +2266,14 @@ void handleES100Interrupt() {
         } else {
             // Reception complete but decode failed
             if (es100UsingTracking) {
-                // Tracking mode failed — retry immediately with normal mode
-                Serial.println("Tracking mode failed, falling back to normal mode");
+                // Tracking decode failed — poor signal conditions make normal mode (~134 s)
+                // equally unlikely to succeed. Retry tracking on the next scheduled sync.
+                // startWWVBSync() will fall back to normal mode after ES100_TRACKING_FALLBACK_MS.
+                Serial.println("Tracking mode failed, will retry tracking on next scheduled sync");
                 es100Receiving = false;
                 es100UsingTracking = false;
                 es100.stopReception();
-                es100TrackingReady = false;  // Require a new normal sync before trying tracking again
-
-                // Start normal mode attempt immediately
-                es100InterruptFlag = false;
-                if (es100.startReception(ES100_CTRL0_NORMAL)) {
-                    es100Receiving = true;
-                    lastSyncAttempt = millis();
-                    Serial.println("Normal mode fallback started");
-                } else {
-                    Serial.println("Normal mode fallback failed to start");
-                    recordSyncFailure();
-                }
+                recordSyncFailure(true);
                 return;
             }
             Serial.println("RX_OK not set despite RX_COMPLETE");
@@ -2287,16 +2325,16 @@ void setup() {
     Serial.printf("[BOOT] Free heap: %d bytes\n", ESP.getFreeHeap());
     Serial.printf("[BOOT] PSRAM: %s\n", psramFound() ? "Found" : "Not found");
 
-    // Initialize I2C bus 0 (touch, PMU, ES100) - 400kHz fast mode
+    // Initialize I2C bus 0 (touch, PMU, DS3231) - 400kHz fast mode
     Serial.println("[BOOT] Initializing I2C...");
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(400000);
-    Serial.println("[BOOT] Wire initialized (400kHz) - touch, PMU, ES100 on GPIO 2/3");
+    Serial.println("[BOOT] Wire initialized (400kHz) - touch, PMU, DS3231 on GPIO 2/3");
 
-    // Initialize I2C bus 1 (DS3231 RTC) - 100kHz standard mode
+    // Initialize I2C bus 1 (ES100 isolated) - 100kHz standard mode
     Wire1.begin(ES100_SDA_PIN, ES100_SCL_PIN);
     Wire1.setClock(100000);
-    Serial.println("[BOOT] Wire1 initialized (100kHz) - DS3231 on GPIO 15/16");
+    Serial.println("[BOOT] Wire1 initialized (100kHz) - ES100 on GPIO 15/16 (isolated)");
 
     // I2C bus scan on both buses
     // Note: ES100 (0x32) will NOT appear here — it only responds when EN is HIGH,
@@ -2506,6 +2544,22 @@ void loop() {
         statusData.batteryCharging = amoled.isCharging();
         statusData.timeSource = (uint8_t)lastTimeSource;
         statusData.lastSyncMillis = lastTimeSyncMillis;
+        statusData.es100Available = es100Available;
+        statusData.es100Receiving = es100Receiving;
+        statusData.es100Tracking  = es100UsingTracking;
+
+        // Critical battery — force deep sleep after 3 consecutive readings to protect NVS
+        if (statusData.batteryPct <= CRITICAL_BATTERY_THRESHOLD &&
+            !statusData.batteryCharging && statusData.batteryMv > 0) {
+            critBattCount++;
+            if (critBattCount >= 3) {
+                Serial.printf("[BATT] CRITICAL %d%% (%.2fV) — forcing deep sleep to protect NVS\n",
+                             statusData.batteryPct, statusData.batteryMv / 1000.0);
+                performShutdown();
+            }
+        } else {
+            critBattCount = 0;
+        }
 
         // Low battery alert at threshold
         if (statusData.batteryPct <= LOW_BATTERY_THRESHOLD &&
@@ -2558,22 +2612,13 @@ void loop() {
     unsigned long rxTimeout = es100UsingTracking ? SYNC_TIMEOUT_TRACKING_MS : SYNC_TIMEOUT_NORMAL_MS;
     if (es100Receiving && (millis() - lastSyncAttempt > rxTimeout)) {
         if (es100UsingTracking) {
-            // Tracking timed out — fall back to normal mode
-            Serial.println("Tracking mode timeout, falling back to normal mode");
+            // Tracking timed out — poor signal; normal mode would also fail.
+            // Retry tracking on the next scheduled sync.
+            // startWWVBSync() falls back to normal mode after ES100_TRACKING_FALLBACK_MS.
+            Serial.println("Tracking mode timeout, will retry tracking on next scheduled sync");
             stopWWVBSync();
-            es100TrackingReady = false;
             es100UsingTracking = false;
-
-            // Start normal mode attempt immediately
-            es100InterruptFlag = false;
-            if (es100.startReception(ES100_CTRL0_NORMAL)) {
-                es100Receiving = true;
-                lastSyncAttempt = millis();
-                Serial.println("Normal mode fallback started");
-            } else {
-                Serial.println("Normal mode fallback failed to start");
-                recordSyncFailure();
-            }
+            recordSyncFailure(true);
         } else {
             Serial.println("Reception timeout - stopping");
             stopWWVBSync();

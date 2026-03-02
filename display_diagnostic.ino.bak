@@ -1,0 +1,142 @@
+/**
+ * Display Diagnostic Test for LilyGo T-Display-S3 AMOLED
+ *
+ * This test helps identify display initialization issues
+ * Upload this to test if the display hardware is working
+ */
+
+#include <LilyGo_AMOLED.h>
+#include <TFT_eSPI.h>
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+LilyGo_Class amoled;
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);  // Give serial time to initialize
+
+    Serial.println("\n========================================");
+    Serial.println("  LilyGo AMOLED Display Diagnostic");
+    Serial.println("========================================\n");
+
+    // Test 1: Initialize AMOLED
+    Serial.println("[1/6] Initializing AMOLED display...");
+    if (!amoled.begin()) {
+        Serial.println("ERROR: AMOLED initialization FAILED!");
+        Serial.println("Check:");
+        Serial.println("  - Power connections");
+        Serial.println("  - Display ribbon cable");
+        Serial.println("  - Board selection in platformio.ini");
+        while(1) {
+            delay(1000);
+            Serial.println("HALT: Display init failed");
+        }
+    }
+    Serial.println("OK: AMOLED initialized successfully");
+
+    // Display board info
+    Serial.printf("Display dimensions: %d x %d\n", amoled.width(), amoled.height());
+
+    // Test 2: Set brightness
+    Serial.println("\n[2/6] Setting brightness to 200...");
+    amoled.setBrightness(200);
+    Serial.println("OK: Brightness set");
+
+    // Test 3: Test without sprite (direct write)
+    Serial.println("\n[3/6] Testing direct color fill...");
+    Serial.println("  Filling RED...");
+    uint16_t red_buffer[100];
+    for(int i = 0; i < 100; i++) red_buffer[i] = TFT_RED;
+
+    // Fill screen with red using direct writes
+    for(int y = 0; y < amoled.height(); y += 10) {
+        for(int x = 0; x < amoled.width(); x += 100) {
+            int w = min(100, amoled.width() - x);
+            amoled.pushColors(x, y, w, 10, red_buffer);
+        }
+    }
+    delay(2000);
+
+    // Test 4: Create sprite
+    Serial.println("\n[4/6] Creating sprite...");
+    Serial.printf("  Size: %d x %d (%lu bytes)\n",
+                  amoled.width(), amoled.height(),
+                  (unsigned long)(amoled.width() * amoled.height() * 2));
+
+    void* spritePtr = sprite.createSprite(amoled.width(), amoled.height());
+    if (spritePtr == nullptr) {
+        Serial.println("ERROR: Sprite creation FAILED!");
+        Serial.println("  Not enough PSRAM/RAM");
+        Serial.println("  Try smaller sprite or enable PSRAM in platformio.ini");
+        while(1) {
+            delay(1000);
+            Serial.println("HALT: Sprite creation failed");
+        }
+    }
+    Serial.println("OK: Sprite created successfully");
+
+    // Test 5: Configure sprite
+    Serial.println("\n[5/6] Configuring sprite...");
+    sprite.setSwapBytes(true);
+    Serial.println("OK: Sprite configured");
+
+    // Test 6: Draw to sprite and push
+    Serial.println("\n[6/6] Testing sprite rendering...");
+
+    // Test GREEN
+    Serial.println("  Drawing GREEN...");
+    sprite.fillSprite(TFT_GREEN);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(),
+                     (uint16_t *)sprite.getPointer());
+    delay(2000);
+
+    // Test BLUE with text
+    Serial.println("  Drawing BLUE with text...");
+    sprite.fillSprite(TFT_BLUE);
+    sprite.setTextColor(TFT_WHITE, TFT_BLUE);
+    sprite.setTextSize(2);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString("LilyGo AMOLED", amoled.width()/2, amoled.height()/2 - 30);
+    sprite.drawString("Display Test", amoled.width()/2, amoled.height()/2);
+    sprite.drawString("SUCCESS!", amoled.width()/2, amoled.height()/2 + 30);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(),
+                     (uint16_t *)sprite.getPointer());
+
+    Serial.println("\n========================================");
+    Serial.println("  Diagnostic Complete - ALL TESTS PASSED");
+    Serial.println("========================================");
+    Serial.println("\nIf you see horizontal lines instead of");
+    Serial.println("colored screens, there may be a hardware issue.");
+    Serial.println("\nCheck Serial Monitor output for errors.");
+}
+
+void loop() {
+    // Cycle through colors
+    delay(2000);
+
+    sprite.fillSprite(TFT_RED);
+    sprite.setTextColor(TFT_WHITE, TFT_RED);
+    sprite.setTextSize(3);
+    sprite.setTextDatum(MC_DATUM);
+    sprite.drawString("RED", amoled.width()/2, amoled.height()/2);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(),
+                     (uint16_t *)sprite.getPointer());
+    delay(1000);
+
+    sprite.fillSprite(TFT_GREEN);
+    sprite.setTextColor(TFT_WHITE, TFT_GREEN);
+    sprite.drawString("GREEN", amoled.width()/2, amoled.height()/2);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(),
+                     (uint16_t *)sprite.getPointer());
+    delay(1000);
+
+    sprite.fillSprite(TFT_BLUE);
+    sprite.setTextColor(TFT_WHITE, TFT_BLUE);
+    sprite.drawString("BLUE", amoled.width()/2, amoled.height()/2);
+    amoled.pushColors(0, 0, amoled.width(), amoled.height(),
+                     (uint16_t *)sprite.getPointer());
+    delay(1000);
+
+    Serial.println("Cycling colors...");
+}

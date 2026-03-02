@@ -1,0 +1,51 @@
+// Absolute minimal test - use ONLY if diagnostic fails
+// Rename to test_basic.ino to use
+#include <LilyGo_AMOLED.h>
+
+LilyGo_Class amoled;
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("Minimal AMOLED Test");
+
+    if (!amoled.begin()) {
+        Serial.println("Init failed!");
+        while(1) delay(1000);
+    }
+
+    delay(200);  // Critical delay for display to stabilize
+
+    Serial.printf("Display: %dx%d\n", amoled.width(), amoled.height());
+
+    // Fill with solid color using minimal approach
+    uint16_t testColor = 0xF800;  // Red in RGB565
+    uint16_t line_buffer[240];    // Assuming max width of 240
+    for(int i = 0; i < amoled.width(); i++) {
+        line_buffer[i] = testColor;
+    }
+
+    Serial.println("Filling display RED...");
+    for(int y = 0; y < amoled.height(); y++) {
+        amoled.pushColors(0, y, amoled.width(), 1, line_buffer);
+    }
+
+    delay(2000);
+
+    // Try GREEN
+    testColor = 0x07E0;  // Green
+    for(int i = 0; i < amoled.width(); i++) {
+        line_buffer[i] = testColor;
+    }
+
+    Serial.println("Filling display GREEN...");
+    for(int y = 0; y < amoled.height(); y++) {
+        amoled.pushColors(0, y, amoled.width(), 1, line_buffer);
+    }
+
+    Serial.println("Test complete!");
+}
+
+void loop() {
+    delay(1000);
+}
