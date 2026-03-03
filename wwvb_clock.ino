@@ -73,6 +73,8 @@ bool es100Receiving = false;
 bool es100Available = false;
 bool es100TrackingReady = false;        // True after a successful normal-mode decode
 bool es100UsingTracking = false;        // True if current attempt is tracking mode
+bool pendingTrackingStart = false;      // True when waiting to write Control 0 at second :55
+unsigned long trackingStartAtMs = 0;   // millis() target for the Control 0 write
 unsigned long es100TrackingReadySinceMs = 0; // millis() when es100TrackingReady was last set
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastSyncAttempt = 0;
@@ -81,6 +83,18 @@ bool daytimeSkipActive = false;       // True when backed off until nighttime
 int8_t utcOffset = -5;  // Eastern Time
 bool dstActive = false;
 unsigned long lastDSTCheck = 0;  // millis() of last auto-DST computation
+
+// Leap second warning decoded from WWVB frame (0=none, 1=positive, 2=negative)
+uint8_t wwvbLeapSecondWarning = 0;
+
+// Per-antenna sync success counters (persisted in NVS)
+uint16_t ant1Successes = 0;
+uint16_t ant2Successes = 0;
+
+// Sync log ring buffer — last 20 individual sync outcomes
+SyncLogEntry syncLog[SYNC_LOG_SIZE];
+uint8_t syncLogHead   = 0;   // next write index
+uint8_t syncLogFilled = 0;   // valid entry count (0..SYNC_LOG_SIZE)
 
 // ES100 initialization retry tracking
 uint8_t es100InitRetries = 0;
@@ -164,6 +178,17 @@ CaptivePortal captivePortal;
 StatusServer statusServer;
 StatusData statusData;
 bool portalCredsReceived = false;  // Flag: credentials arrived from captive portal, handle in loop
+
+// ============================================================================
+// Forward Declarations
+// PlatformIO does not auto-generate declarations for functions defined later
+// in the file when they are referenced inside lambdas or earlier functions.
+// Default args are omitted here; the definitions supply them.
+// ============================================================================
+void startWWVBSync(bool forceNormal);
+void startWWVBSyncTracking();
+void recordSyncFailure(bool wasTracking);
+void addSyncLogEntry(bool success, bool tracking, uint8_t antenna);
 
 // ============================================================================
 // On-Screen Keyboard State
@@ -885,8 +910,25 @@ void wifiCheckConnection() {
             statusServer.setOnSyncRequest([]() {
                 daytimeSkipActive = false;
                 daytimeFailures = 0;
-                if (!es100Receiving) startWWVBSync();
+                if (!es100Receiving && !pendingTrackingStart) startWWVBSync(true); // force normal mode
             });
+            statusServer.setOnTrackingRequest([]() {
+                daytimeSkipActive = false;
+                daytimeFailures = 0;
+                if (!es100Receiving && !pendingTrackingStart) startWWVBSyncTracking();
+            });
+            statusServer.setOnSettingsRequest([](int8_t off, bool dst) {
+                utcOffset = off;
+                dstActive = dst;
+                preferences.begin("wwvb", false);
+                preferences.putChar("utcOffset", utcOffset);
+                preferences.putBool("dst", dstActive);
+                preferences.end();
+                captivePortal.setTimezone(utcOffset, dstActive);
+                Serial.printf("[SETTINGS] UTC offset=%+d DST=%s (via web)\n",
+                              utcOffset, dstActive ? "on" : "off");
+            });
+            statusServer.setSyncLog(syncLog, &syncLogHead, &syncLogFilled);
             statusServer.begin();
         }
 
@@ -946,6 +988,8 @@ void wifiStartAP() {
 
     // Give captive portal access to time for the clock display
     captivePortal.setTimeManager(&timeManager);
+    captivePortal.setTimezone(utcOffset, dstActive);
+    captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
     // Start DNS + HTTP servers on the AP
     Serial.println("[WIFI] Starting portal servers...");
@@ -1655,12 +1699,14 @@ void handleTouch() {
                         preferences.begin("wwvb", false);
                         preferences.putChar("utcOffset", utcOffset);
                         preferences.end();
+                        captivePortal.setTimezone(utcOffset, dstActive);
                         Serial.printf("[SETTINGS] UTC offset: %+d\n", utcOffset);
                     } else if (touchStartX >= utcPlusX && touchStartX <= utcPlusX + utcBtnW && utcOffset < 14) {
                         utcOffset++;
                         preferences.begin("wwvb", false);
                         preferences.putChar("utcOffset", utcOffset);
                         preferences.end();
+                        captivePortal.setTimezone(utcOffset, dstActive);
                         Serial.printf("[SETTINGS] UTC offset: %+d\n", utcOffset);
                     }
                 } else {
@@ -1746,6 +1792,10 @@ void saveTimeToPreferences() {
     unsigned long trkAge = es100TrackingReady ? (millis() - es100TrackingReadySinceMs) : 0xFFFFFFFFUL;
     preferences.putULong("trkAge", trkAge);
 
+    // Persist per-antenna success counters
+    preferences.putUShort("ant1ok", ant1Successes);
+    preferences.putUShort("ant2ok", ant2Successes);
+
     preferences.end();
     Serial.println("Time saved to preferences");
 }
@@ -1770,6 +1820,8 @@ bool loadTimeFromPreferences() {
     unsigned long saveMillis = preferences.getULong("saveMillis", 0);
     bool savedTrkReady = preferences.getBool("trkReady", false);
     unsigned long savedTrkAge = preferences.getULong("trkAge", 0xFFFFFFFFUL);
+    ant1Successes = preferences.getUShort("ant1ok", 0);
+    ant2Successes = preferences.getUShort("ant2ok", 0);
 
     preferences.end();
 
@@ -1866,6 +1918,7 @@ bool loadTimeFromDS3231() {
         lastTimeSource = TIME_SRC_RTC;
         lastTimeSyncMillis = millis();
         snapshotSyncTime();
+        captivePortal.setTimeSource((uint8_t)lastTimeSource);
     }
 
     return true;
@@ -1998,6 +2051,7 @@ bool ntpClientSync() {
     lastTimeSyncMillis = millis();
     snapshotSyncTime();
     ntpServer.setStratum(2, ntpServerIP);
+    captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
     // Recompute DST from calendar after NTP time update
     if (AUTO_DST_ENABLED) {
@@ -2157,42 +2211,97 @@ void recordSyncFailure(bool wasTracking = false) {
 }
 
 // ============================================================================
+// Sync Log Helper
+// ============================================================================
+
+/**
+ * @brief Append one entry to the sync log ring buffer
+ * @param success  True if the sync succeeded
+ * @param tracking True if tracking mode was used
+ * @param antenna  Antenna that was used (1 or 2; 0 = unknown)
+ */
+void addSyncLogEntry(bool success, bool tracking, uint8_t antenna) {
+    SyncLogEntry& e = syncLog[syncLogHead];
+    ClockTime t = timeManager.getUTCTime();
+    snprintf(e.timeStr, sizeof(e.timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
+             t.year, t.month, t.day, t.hour, t.minute, t.second);
+    e.success  = success;
+    e.tracking = tracking;
+    e.antenna  = antenna;
+    syncLogHead = (syncLogHead + 1) % SYNC_LOG_SIZE;
+    if (syncLogFilled < SYNC_LOG_SIZE) syncLogFilled++;
+}
+
+// ============================================================================
 // ES100 Sync Functions
 // ============================================================================
-void startWWVBSync() {
+
+// Convenience wrapper: ensures tracking-ready state before calling startWWVBSync.
+// Use this instead of manually setting es100TrackingReady before the call.
+void startWWVBSyncTracking() {
+    if (!es100TrackingReady) {
+        es100TrackingReady = true;
+        es100TrackingReadySinceMs = millis();
+    }
+    startWWVBSync(false);
+}
+
+void startWWVBSync(bool forceNormal = false) {
     if (es100Receiving) return;
+
+    // Cancel any pending scheduled tracking start (e.g. manual sync button pressed)
+    if (pendingTrackingStart) {
+        pendingTrackingStart = false;
+        if (es100.isPoweredOn()) es100.powerOff();
+        Serial.println("[WWVB] Pending tracking start cancelled");
+    }
+
     if (!es100Available) {
         lastSyncAttempt = millis();  // Prevent repeated calls
         return;
     }
 
-    // Use tracking mode for hourly re-syncs after a successful normal decode
-    uint8_t mode = ES100_CTRL0_NORMAL;
     es100UsingTracking = false;
 
-    if (ES100_USE_TRACKING && es100TrackingReady) {
+    if (!forceNormal && ES100_USE_TRACKING && es100TrackingReady) {
         if (millis() - es100TrackingReadySinceMs >= ES100_TRACKING_FALLBACK_MS) {
-            // 24 hours without a successful sync — do a full normal-mode decode
-            Serial.println("Tracking mode expired (24h without sync), switching to normal mode");
+            Serial.println("[WWVB] Tracking mode expired (7 days), switching to normal mode");
             es100TrackingReady = false;
         } else {
-            mode = ES100_CTRL0_NORMAL | ES100_CTRL0_TRACKING;  // 0x11
+            // Tracking reception MUST start (Control 0 write) at second :55.
+            // The 22-second window captures the WWVB sync word within ±4s of drift.
+            // Schedule the start; the main loop fires it at the right moment.
+            ClockTime utc = timeManager.getUTCTime();
+            uint8_t sec = utc.second;
+            unsigned long msUntil55 = (sec <= 55) ? (unsigned long)(55 - sec) * 1000UL
+                                                   : (unsigned long)(60 - sec + 55) * 1000UL;
+
             es100UsingTracking = true;
-            Serial.println("Starting WWVB tracking mode sync...");
+            lastSyncAttempt = millis();  // Prevent re-triggering during the wait
+            es100InterruptFlag = false;
+
+            // Schedule the Control 0 write for the :55 boundary.
+            // Power on the ES100 shortly before :55 to satisfy the 20ms wakeup.
+            // If msUntil55 is 0 (exactly at :55), the loop fires it immediately.
+            pendingTrackingStart = true;
+            trackingStartAtMs = millis() + msUntil55;
+            Serial.printf("[WWVB] Tracking scheduled in %lus (current second: %02d)\n",
+                          msUntil55 / 1000UL, sec);
+            return;
         }
     }
-    if (!es100UsingTracking) {
-        Serial.println("Starting WWVB normal mode sync...");
-    }
 
+    // Normal mode — start with historically better antenna (toggles if it fails)
+    uint8_t ctrl = (ant2Successes > ant1Successes) ? ES100_CTRL0_NORMAL_ANT2
+                                                   : ES100_CTRL0_NORMAL;
+    Serial.printf("[WWVB] Starting normal mode sync (prefer Ant%d, successes: Ant1=%d Ant2=%d)...\n",
+                  (ant2Successes > ant1Successes) ? 2 : 1, ant1Successes, ant2Successes);
     es100InterruptFlag = false;
-
-    if (es100.startReception(mode)) {
+    if (es100.startReception(ctrl)) {
         es100Receiving = true;
         lastSyncAttempt = millis();
     } else {
-        Serial.println("Failed to start ES100 reception");
-        es100UsingTracking = false;
+        Serial.println("[WWVB] Failed to start normal reception");
         recordSyncFailure();
     }
 }
@@ -2219,25 +2328,63 @@ void handleES100Interrupt() {
             Serial.printf("WWVB reception successful! (%s mode)\n",
                          usedTracking ? "tracking" : "normal");
 
-            ES100Time rxTime;
-            if (es100.readDateTime(&rxTime)) {
-                Serial.printf("Received UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-                             rxTime.year, rxTime.month, rxTime.day,
-                             rxTime.hour, rxTime.minute, rxTime.second);
+            bool syncOk  = false;
+            bool ant2Used = false;  // antenna used this reception (shared by both branches)
 
-                timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
-                                   rxTime.hour, rxTime.minute, rxTime.second);
+            if (usedTracking) {
+                // Tracking mode: only register 0x09 (Second) is valid.
+                // Year/Month/Day/Hour/Minute are cleared to 0x00 by the START write
+                // and must NOT be used — doing so would corrupt the RTC with year 2000.
+                // Instead, snap only the seconds field of the current RTC time.
+                uint8_t wwvbSecond;
+                if (es100.readTrackingResult(&wwvbSecond, &ant2Used, status0)) {
+                    ClockTime cur = timeManager.getUTCTime();
+                    Serial.printf("Tracking snap: RTC was %04d-%02d-%02d %02d:%02d:%02d, "
+                                  "WWVB second=%02d (Ant%d)\n",
+                                  cur.year, cur.month, cur.day,
+                                  cur.hour, cur.minute, cur.second,
+                                  wwvbSecond, ant2Used ? 2 : 1);
+                    timeManager.setTime(cur.year, cur.month, cur.day,
+                                        cur.hour, cur.minute, wwvbSecond);
+                    syncOk = true;
+                } else {
+                    Serial.println("Failed to read tracking result");
+                }
+            } else {
+                // Normal 1-minute frame: all time registers are valid
+                ES100Time rxTime;
+                if (es100.readDateTime(&rxTime)) {
+                    Serial.printf("Received UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+                                 rxTime.year, rxTime.month, rxTime.day,
+                                 rxTime.hour, rxTime.minute, rxTime.second);
+                    timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
+                                       rxTime.hour, rxTime.minute, rxTime.second);
 
-                // Extract DST status from Status0 register (bits 5-6)
-                // After shifting: 0=Not in effect, 1=Ends today, 2=Begins today, 3=In effect
-                uint8_t dstBits = (status0 >> 5) & 0x03;
+                    // DST only comes from normal mode (tracking does not provide it)
+                    uint8_t dstBits = (status0 >> 5) & 0x03;
+                    dstActive = (dstBits >= 2);
 
-                // Apply DST if currently in effect (3) or begins today (2)
-                // Don't apply if not in effect (0) or ends today (1)
-                // This provides best approximation between hourly syncs
-                dstActive = (dstBits >= 2);
+                    // Leap second warning (bits 3:4 of Status 0; normal mode only)
+                    uint8_t lsw = (status0 & ES100_STATUS_LSW_MASK) >> 3;
+                    if (lsw != wwvbLeapSecondWarning) {
+                        wwvbLeapSecondWarning = lsw;
+                        if (lsw) Serial.printf("[WWVB] Leap second warning: %s\n",
+                                               lsw == 1 ? "+1s end of month" : "-1s end of month");
+                    }
 
+                    ant2Used = rxTime.antenna2Used;
+                    syncOk = true;
+                } else {
+                    Serial.println("Failed to read time data");
+                }
+            }
+
+            if (syncOk) {
                 receptionHistory.recordAttempt(true);
+
+                // Track per-antenna successes and log the event
+                if (ant2Used) ant2Successes++; else ant1Successes++;
+                addSyncLogEntry(true, usedTracking, ant2Used ? 2 : 1);
 
                 // Save time to persistent storage
                 saveTimeToPreferences();
@@ -2248,9 +2395,9 @@ void handleES100Interrupt() {
                 lastTimeSyncMillis = millis();
                 snapshotSyncTime();
                 ntpServer.setStratum(1, "WWVB");
+                captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
-                // Enable tracking mode for subsequent syncs; record when it was set
-                // so the 24-hour fallback timer in startWWVBSync() has a reference point.
+                // Enable tracking mode for subsequent syncs
                 es100TrackingReady = true;
                 es100TrackingReadySinceMs = millis();
 
@@ -2260,8 +2407,8 @@ void handleES100Interrupt() {
 
                 Serial.println("Time synchronized!");
             } else {
-                Serial.println("Failed to read time data");
-                recordSyncFailure();
+                addSyncLogEntry(false, usedTracking, (status0 & ES100_STATUS_ANT) ? 2 : 1);
+                recordSyncFailure(usedTracking);
             }
         } else {
             // Reception complete but decode failed
@@ -2273,10 +2420,12 @@ void handleES100Interrupt() {
                 es100Receiving = false;
                 es100UsingTracking = false;
                 es100.stopReception();
+                addSyncLogEntry(false, true, (status0 & ES100_STATUS_ANT) ? 2 : 1);
                 recordSyncFailure(true);
                 return;
             }
             Serial.println("RX_OK not set despite RX_COMPLETE");
+            addSyncLogEntry(false, false, (status0 & ES100_STATUS_ANT) ? 2 : 1);
             recordSyncFailure();
         }
 
@@ -2310,16 +2459,16 @@ void setup() {
     // Configure task watchdog timer — auto-resets on I2C lockup or infinite loop
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     esp_task_wdt_config_t wdtConfig = {
-        .timeout_ms = 15000,
+        .timeout_ms = WATCHDOG_TIMEOUT_MS,
         .idle_core_mask = 0,
         .trigger_panic = true,
     };
     esp_task_wdt_reconfigure(&wdtConfig);
 #else
-    esp_task_wdt_init(15, true);
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_MS / 1000, true);
 #endif
     esp_task_wdt_add(NULL);
-    Serial.println("[WDT] Watchdog configured: 15s timeout");
+    Serial.printf("[WDT] Watchdog configured: %ds timeout\n", WATCHDOG_TIMEOUT_MS / 1000);
 
     Serial.println("[BOOT] Starting initialization...");
     Serial.printf("[BOOT] Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -2544,9 +2693,13 @@ void loop() {
         statusData.batteryCharging = amoled.isCharging();
         statusData.timeSource = (uint8_t)lastTimeSource;
         statusData.lastSyncMillis = lastTimeSyncMillis;
-        statusData.es100Available = es100Available;
-        statusData.es100Receiving = es100Receiving;
-        statusData.es100Tracking  = es100UsingTracking;
+        statusData.es100Available        = es100Available;
+        statusData.es100Receiving        = es100Receiving;
+        statusData.es100Tracking         = es100UsingTracking;
+        statusData.es100PendingTracking  = pendingTrackingStart;
+        statusData.leapSecondWarning     = wwvbLeapSecondWarning;
+        statusData.ant1Successes         = ant1Successes;
+        statusData.ant2Successes         = ant2Successes;
 
         // Critical battery — force deep sleep after 3 consecutive readings to protect NVS
         if (statusData.batteryPct <= CRITICAL_BATTERY_THRESHOLD &&
@@ -2595,8 +2748,40 @@ void loop() {
         receptionHistory.hourlyTick();
     }
     
+    // Pending tracking start: fire Control 0 write at second :55
+    // (tracking reception requires the write to happen at exactly :55 ± drift tolerance)
+    if (pendingTrackingStart && !es100Receiving) {
+        unsigned long now = millis();
+
+        // Abort if we've waited longer than the maximum allowed pending time
+        if (now > trackingStartAtMs + TRACKING_PENDING_TIMEOUT_MS) {
+            Serial.println("[WWVB] Pending tracking start timed out — aborting");
+            pendingTrackingStart = false;
+            if (es100.isPoweredOn()) es100.powerOff();
+            es100UsingTracking = false;
+            recordSyncFailure(true);
+        }
+        // Power on ES100 ~50ms before the :55 boundary to satisfy wakeup time
+        else if (!es100.isPoweredOn() && now >= trackingStartAtMs - (ES100_WAKEUP_TIME_MS + 30UL)) {
+            es100.powerOn();
+        }
+        // Write Control 0 at the :55 boundary
+        else if (now >= trackingStartAtMs) {
+            pendingTrackingStart = false;
+            if (es100.startReception(ES100_CTRL0_TRACK_ANT1)) {
+                es100Receiving = true;
+                Serial.println("[WWVB] Tracking mode sync started at :55");
+            } else {
+                Serial.println("[WWVB] Failed to start tracking reception at :55");
+                if (es100.isPoweredOn()) es100.powerOff();
+                es100UsingTracking = false;
+                recordSyncFailure(true);
+            }
+        }
+    }
+
     // Periodic sync attempts — time-aware schedule with daytime backoff
-    if (!es100Receiving) {
+    if (!es100Receiving && !pendingTrackingStart) {
         unsigned long timeSinceLastAttempt = millis() - lastSyncAttempt;
         unsigned long interval = getSyncInterval();
 

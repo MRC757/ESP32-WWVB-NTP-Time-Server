@@ -210,6 +210,32 @@ bool ES100::readDateTime(ES100Time *time) {
     return true;
 }
 
+bool ES100::readTrackingResult(uint8_t *second, bool *antenna2Used, uint8_t cachedStatus0) {
+    if (!isPoweredOn() || second == nullptr) {
+        return false;
+    }
+
+    // Both RX_OK and TRACKING must be set for a valid tracking result.
+    // Use cachedStatus0 if the caller already read it (avoids a redundant I2C transaction).
+    uint8_t status0 = (cachedStatus0 != 0xFF) ? cachedStatus0 : readStatus0();
+    if (!(status0 & ES100_STATUS_RX_OK) || !(status0 & ES100_STATUS_TRACKING)) {
+        Serial.printf("readTrackingResult: invalid status0=0x%02X (need RX_OK+TRACKING)\n", status0);
+        return false;
+    }
+
+    // Only register 0x09 (Second) is valid after tracking — all others are cleared to 0x00
+    uint8_t secondBcd = readRegister(ES100_REG_SECOND);
+    *second = bcdToDec(secondBcd & 0x7F);
+
+    if (antenna2Used != nullptr) {
+        *antenna2Used = (status0 & ES100_STATUS_ANT) != 0;
+    }
+
+    Serial.printf("ES100 tracking result: second=%02d (Ant%d)\n",
+                  *second, (status0 & ES100_STATUS_ANT) ? 2 : 1);
+    return true;
+}
+
 // ============================================================================
 // Low-Level I2C Functions
 // ============================================================================

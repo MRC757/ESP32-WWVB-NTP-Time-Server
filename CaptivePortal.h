@@ -59,6 +59,17 @@ public:
     void setTimeManager(TimeManager* tm);
 
     /**
+     * @brief Set the current UTC offset and DST state for local time display
+     */
+    void setTimezone(int8_t offset, bool dst);
+
+    /**
+     * @brief Set the current time source for status badge on portal
+     * @param src 0=None, 1=RTC, 2=NTP, 3=WWVB
+     */
+    void setTimeSource(uint8_t src);
+
+    /**
      * @brief Check if portal is running
      */
     bool isRunning() const;
@@ -70,6 +81,9 @@ private:
     String _networkOptions;
     String _statusMessage;
     TimeManager* _timeManager;
+    int8_t  _utcOffset  = 0;
+    bool    _dst        = false;
+    uint8_t _timeSource = 0;
     std::function<void(const String&, const String&)> _onCredentials;
 
     void handleRoot();

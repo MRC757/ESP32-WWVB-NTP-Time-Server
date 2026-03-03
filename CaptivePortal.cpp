@@ -66,6 +66,15 @@ void CaptivePortal::setTimeManager(TimeManager* tm) {
     _timeManager = tm;
 }
 
+void CaptivePortal::setTimezone(int8_t offset, bool dst) {
+    _utcOffset = offset;
+    _dst = dst;
+}
+
+void CaptivePortal::setTimeSource(uint8_t src) {
+    _timeSource = src;
+}
+
 void CaptivePortal::setStatus(const String& status) {
     _statusMessage = status;
 }
@@ -112,10 +121,12 @@ void CaptivePortal::handleStatus() {
 void CaptivePortal::handleTime() {
     if (_timeManager) {
         ClockTime t = _timeManager->getUTCTime();
-        char buf[64];
+        char buf[96];
         snprintf(buf, sizeof(buf),
-            "{\"h\":%d,\"m\":%d,\"s\":%d,\"Y\":%d,\"M\":%d,\"D\":%d}",
-            t.hour, t.minute, t.second, t.year, t.month, t.day);
+            "{\"h\":%d,\"m\":%d,\"s\":%d,\"Y\":%d,\"M\":%d,\"D\":%d"
+            ",\"off\":%d,\"dst\":%s,\"src\":%d}",
+            t.hour, t.minute, t.second, t.year, t.month, t.day,
+            _utcOffset, _dst ? "true" : "false", _timeSource);
         _httpServer.send(200, "application/json", buf);
     } else {
         _httpServer.send(200, "application/json", "{\"error\":\"no time source\"}");
@@ -152,6 +163,8 @@ String CaptivePortal::buildPage() {
     html += ".clock-time{font-size:36px;font-family:monospace;color:#00ff88;letter-spacing:2px;}";
     html += ".clock-date{font-size:14px;color:#888;margin-top:4px;}";
     html += ".clock-label{font-size:11px;color:#666;margin-top:2px;}";
+    html += ".local-time{font-size:22px;font-family:monospace;color:#00d4ff;margin-top:8px;}";
+    html += ".src-badge{display:inline-block;margin-top:4px;padding:2px 8px;border-radius:10px;font-size:11px;background:#2a2a3e;color:#aaa;}";
     html += ".ntp-info{text-align:center;margin:8px 0 16px;padding:8px;background:#1a2a1a;border-radius:6px;border:1px solid #2a4a2a;font-size:12px;color:#88cc88;}";
     html += "label{display:block;margin:12px 0 4px;font-size:14px;}";
     html += "select,input{width:100%;padding:10px;border:1px solid #444;border-radius:6px;font-size:16px;background:#2a2a3e;color:#e0e0e0;box-sizing:border-box;}";
@@ -170,7 +183,11 @@ String CaptivePortal::buildPage() {
     html += "<div class='clock'>";
     html += "<div class='clock-time' id='utc'>" + timeStr + "</div>";
     html += "<div class='clock-date' id='date'>" + dateStr + "</div>";
-    html += "<div class='clock-label'>UTC (WWVB Synchronized)</div>";
+    html += "<div class='clock-label'>UTC</div>";
+    html += "<div class='local-time' id='local'>--:--:--</div>";
+    html += "<div class='clock-date' id='ldate'></div>";
+    html += "<div class='clock-label'>Local</div>";
+    html += "<div class='src-badge' id='srclabel'>Checking...</div>";
     html += "</div>";
 
     // NTP server info
@@ -196,15 +213,29 @@ String CaptivePortal::buildPage() {
     html += "</form>";
     html += "<div class='status'>" + _statusMessage + "</div>";
 
-    // JavaScript: poll /time every second and update the clock
+    // JavaScript: poll /time every second, show UTC + local + source badge
     html += "<script>";
     html += "function pad(n){return n<10?'0'+n:n;}";
+    html += "var _srcNames=['No sync','RTC','NTP','WWVB'];";
     html += "function tick(){fetch('/time').then(r=>r.json()).then(d=>{";
-    html += "if(d.h!==undefined){";
+    html += "if(d.h===undefined)return;";
+    // UTC display
     html += "document.getElementById('utc').textContent=pad(d.h)+':'+pad(d.m)+':'+pad(d.s);";
     html += "document.getElementById('date').textContent=d.Y+'/'+pad(d.M)+'/'+pad(d.D);";
-    html += "}}).catch(()=>{});}";
-    html += "setInterval(tick,1000);";
+    // Local time: use Date.UTC to handle day/month rollovers correctly
+    html += "var utcMs=Date.UTC(d.Y,d.M-1,d.D,d.h,d.m,d.s);";
+    html += "var lms=utcMs+(d.off||0)*3600000;";
+    html += "var ld=new Date(lms);";
+    html += "document.getElementById('local').textContent=pad(ld.getUTCHours())+':'+pad(ld.getUTCMinutes())+':'+pad(ld.getUTCSeconds());";
+    html += "document.getElementById('ldate').textContent=ld.getUTCFullYear()+'/'+pad(ld.getUTCMonth()+1)+'/'+pad(ld.getUTCDate());";
+    // Source badge
+    html += "var sl=document.getElementById('srclabel');";
+    html += "var sn=_srcNames[d.src||0]||'?';";
+    html += "sl.textContent=sn;";
+    html += "sl.style.background=d.src>=3?'#1a3a1a':d.src>=1?'#2a2a1a':'#2a2a2a';";
+    html += "sl.style.color=d.src>=3?'#88cc88':d.src>=1?'#cccc88':'#888';";
+    html += "}).catch(()=>{});}";
+    html += "setInterval(tick,1000);tick();";
     html += "</script>";
 
     html += "</body></html>";

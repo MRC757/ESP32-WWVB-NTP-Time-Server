@@ -20,6 +20,9 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Time Source Priority**: WWVB > NTP > RTC > none; displayed on the UTC info page
 - **Automatic DST Handling**: Uses DST data from the ES100 signal; adjustable in config
 - **Adaptive Sync Schedule**: 5-minute attempts until first lock; 1-hour at night (best propagation); 4-hour during the day
+- **Tracking Mode**: After the first successful normal-mode sync, subsequent syncs use ES100 tracking mode (~24.5 s vs ~134 s). Tracking decodes only the WWVB sync word to snap the seconds field with ±4 s tolerance. The Control 0 register write must occur at second :55 of any minute; the firmware schedules this non-blocking via the main loop. Falls back to normal mode after 7 days without a full sync.
+- **Leap Second Detection**: The WWVB signal carries a leap second warning in the week(s) before a scheduled UTC adjustment. The firmware extracts this from the ES100 Status 0 register (bits 3:4) and displays it on the web dashboard.
+- **Antenna Performance Tracking**: Per-antenna success counts are accumulated across reboots (NVS). The normal-mode sync automatically starts on whichever antenna has historically had more successes.
 
 ### Display & Touch Interface
 - **Touch Navigation**: Swipe left/right to move between 4 pages; long-press 10 s to shut down
@@ -32,8 +35,8 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 
 ### Networking
 - **Stratum 1 NTP Server**: Serves RFC 5905-compliant NTP responses on UDP port 123; reference ID "WWVB"
-- **Status Web Server**: Browseable dashboard at the device's IP (port 80) showing live time, temperature, battery, sync info, and NTP request count
-- **Captive Portal**: If no WiFi credentials are stored, broadcasts an open AP (`WWVB-Clock-Setup`) with a browser-based setup page
+- **Status Web Server**: Browseable dashboard at the device's IP (port 80) showing live time, temperature, battery, sync info, NTP request count, 48-hour WWVB reception chart, manual sync buttons, timezone controls, leap second warning, antenna statistics, and a recent sync log
+- **Captive Portal**: If no WiFi credentials are stored, broadcasts an open AP (`WWVB-Clock-Setup`) with a browser-based setup page showing UTC time, local time, and a sync-source badge
 - **WiFi Credentials**: SSID and password stored in NVS flash (survive reboots)
 
 ### Power & Hardware
@@ -139,14 +142,27 @@ Edit `config.h` to customize the clock.
 #define AUTO_DST_ENABLED      true  // Use DST data from ES100 signal
 ```
 
+The UTC offset can also be changed at runtime from the web dashboard (Settings page → UTC Offset `−`/`+` buttons, DST toggle) without reflashing. Changes are saved to NVS immediately.
+
 ### Sync Schedule
 
 ```c
-#define SYNC_INTERVAL_INITIAL_MS   300000UL   // 5 min (until first lock)
-#define SYNC_INTERVAL_NIGHT_MS    3600000UL   // 1 hour (10 PM – 6 AM)
-#define SYNC_INTERVAL_DAY_MS     14400000UL   // 4 hours (6 AM – 10 PM)
-#define SYNC_DAY_MAX_FAILURES      3          // Failures before skipping to night
+#define SYNC_INTERVAL_INITIAL_MS        300000UL   // 5 min (until first lock)
+#define SYNC_INTERVAL_NIGHT_MS         3600000UL   // 1 hour (10 PM – 6 AM)
+#define SYNC_INTERVAL_DAY_MS          14400000UL   // 4 hours (6 AM – 10 PM)
+#define SYNC_DAY_MAX_FAILURES               3      // Normal-mode failures before skipping to night
+#define SYNC_DAY_MAX_TRACKING_FAILURES     12      // Tracking-mode failures before skipping to night
 ```
+
+### ES100 Tracking Mode
+
+```c
+#define ES100_USE_TRACKING          true           // Enable tracking mode after first sync
+#define ES100_TRACKING_FALLBACK_MS  604800000UL    // Fall back to normal mode after 7 days
+#define TRACKING_PENDING_TIMEOUT_MS 65000UL        // Max wait for :55 boundary (60 s + 5 s margin)
+```
+
+Tracking mode is enabled automatically after any successful normal-mode reception and persists for up to 7 days. Set `ES100_USE_TRACKING false` to always use normal mode.
 
 ### Display
 
@@ -229,12 +245,37 @@ Point any NTP client (router, computer, smart home hub) at the device's IP addre
 ### Status Web Server
 
 Browse to the device's IP address on port 80 to see a live dashboard:
-- Current UTC and local time
-- Time source (WWVB / NTP / RTC / None)
-- Seconds since last WWVB sync
-- DS3231 temperature (°C)
+- Current UTC and local time (updated every 250 ms from a local reference; full data fetched every 30 s)
+- Time source (WWVB / NTP / RTC / None) and time since last sync
+- DS3231 temperature (°C / °F)
 - Battery voltage, percentage, and charging status
 - NTP requests served
+- ES100 receiver state: Idle / Waiting for :55… / Receiving… / Tracking…
+- UTC offset controls (− / + buttons) and DST toggle — saved to NVS immediately
+- Leap second warning from the WWVB signal (shown when a UTC ±1 s adjustment is pending)
+- Antenna success counters (Ant1 / Ant2)
+- 48-hour WWVB reception history bar chart (syncs per hour)
+- Sync log table — last 20 individual sync outcomes (time, mode, antenna, result)
+
+**Manual sync buttons:**
+
+| Button | Mode | Duration | Notes |
+|--------|------|----------|-------|
+| Normal Sync (blue) | Full 1-minute frame | ~134 s | Provides full date, time, and DST data |
+| Tracking Sync (orange) | Sync-word only | ~24.5 s | Snaps seconds field only; waits up to 60 s for the :55 boundary |
+
+Both buttons are disabled while a sync is in progress or a tracking start is pending. The Normal Sync button re-enables after 5 seconds; the Tracking Sync button re-enables after 65 seconds (matching the maximum :55 wait).
+
+**API endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | Full JSON snapshot (time, battery, ES100, chart data, leap second, antenna stats) |
+| `/api/sync` | POST | Start a normal-mode WWVB sync |
+| `/api/sync/tracking` | POST | Schedule a tracking-mode WWVB sync |
+| `/api/settings` | GET | Returns `{"off": -5, "dst": false}` |
+| `/api/settings` | POST | Set UTC offset and DST (`off=-5&dst=0`) |
+| `/api/log` | GET | JSON array of last 20 sync log entries |
 
 ### Sync Status Indicators
 
@@ -302,17 +343,22 @@ Normal behavior. The ESP32-S3 crystal has ~20 ppm accuracy. The DS3231 RTC has ~
 | 0x00 | Control 0 | Reception control |
 | 0x02 | IRQ Status | Interrupt status |
 | 0x03 | Status 0 | Reception status |
-| 0x04–0x09 | Date/Time | BCD-encoded year/month/day/hour/min/sec |
+| 0x04–0x09 | Date/Time | BCD-encoded year/month/day/hour/min/sec (normal mode only) |
 | 0x0A–0x0C | Next DST | Next DST transition month/day/hour |
 | 0x0D | Device ID | Should read 0x10 |
 
+> **Tracking mode register note:** In tracking mode the ES100 START write clears registers 0x04–0x08 (year through minute) to 0x00. Only register 0x09 (Second) is populated after a successful tracking reception. Reading the date/time registers after a tracking sync would corrupt the RTC with year 2000 — the driver's `readTrackingResult()` reads only register 0x09 and snaps it onto the current RTC time.
+
 ### Reception Timing
 
-| Mode | Duration |
-|------|----------|
-| Normal (1-minute frame) | ~134 seconds |
-| Tracking mode | ~24.5 seconds |
-| ES100 wakeup time | ~1–2 ms |
+| Mode | Duration | Notes |
+|------|----------|-------|
+| Normal (1-minute frame) | ~134 seconds | Full date, time, DST; any second |
+| Tracking mode | ~24.5 seconds | Second only; Control 0 must be written at second :55 |
+| ES100 wakeup time | ~20 ms | EN high → I2C ready |
+| Tracking schedule delay | 0–60 seconds | Time until the next :55 boundary |
+
+**Tracking mode timing:** The ES100 datasheet requires the Control 0 register write at exactly second :55 (±4 s drift tolerance) so that the 22-second reception window captures the WWVB frame sync word. The firmware computes the time until the next :55 boundary and schedules the write non-blocking, powering the ES100 on ~50 ms early to satisfy the wakeup requirement.
 
 ### Power Consumption (ES100)
 

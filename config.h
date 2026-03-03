@@ -73,6 +73,10 @@
 // Tracking mode: 30 seconds (typically completes in ~10s)
 #define SYNC_TIMEOUT_TRACKING_MS   30000UL
 
+// Maximum time to wait for the :55 second boundary before aborting a pending
+// tracking start (one full minute + 5 second safety margin)
+#define TRACKING_PENDING_TIMEOUT_MS  65000UL
+
 // ============================================================================
 // DISPLAY CONFIGURATION
 // ============================================================================
@@ -146,6 +150,15 @@
 // 30 s of drift would take ~174 days, so 7 days (~1.2 ms total drift) is well within
 // the tracking mode tolerance.
 #define ES100_TRACKING_FALLBACK_MS  604800000UL  // 7 days
+
+// ============================================================================
+// WATCHDOG CONFIGURATION
+// ============================================================================
+
+// Task watchdog timeout (milliseconds).
+// 15 s is safe: all sync I/O is interrupt-driven; no loop operation blocks
+// longer than a single I2C transaction (~2 ms at 100 kHz).
+#define WATCHDOG_TIMEOUT_MS   15000
 
 // ============================================================================
 // DEBUG CONFIGURATION

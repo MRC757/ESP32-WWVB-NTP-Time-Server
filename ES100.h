@@ -47,11 +47,13 @@
 #define ES100_CTRL0_START_ANT   0x08    // Start with Antenna 2 (0=Ant1)
 #define ES100_CTRL0_TRACKING    0x10    // Enable tracking mode
 
-// Valid Control 0 values for starting reception
+// Valid Control 0 values for starting reception (from datasheet table, page 17)
 #define ES100_CTRL0_NORMAL      0x01    // Normal, start Ant1, toggle
 #define ES100_CTRL0_ANT2_ONLY   0x03    // Antenna 2 only
 #define ES100_CTRL0_ANT1_ONLY   0x05    // Antenna 1 only
 #define ES100_CTRL0_NORMAL_ANT2 0x09    // Normal, start Ant2, toggle
+#define ES100_CTRL0_TRACK_ANT1  0x15    // Tracking, Antenna 1 only — must write at second :55
+#define ES100_CTRL0_TRACK_ANT2  0x13    // Tracking, Antenna 2 only — must write at second :55
 
 // ============================================================================
 // IRQ Status Register Bits
@@ -177,11 +179,25 @@ public:
     uint8_t readStatus0();
     
     /**
-     * @brief Read the received date and time
+     * @brief Read the received date and time (normal mode only)
      * @param time Pointer to ES100Time structure to fill
      * @return true if time was read successfully
+     * @note Do NOT call this after a tracking reception — year/month/day/hour/minute
+     *       registers are cleared (0x00) after tracking. Use readTrackingResult() instead.
      */
     bool readDateTime(ES100Time *time);
+
+    /**
+     * @brief Read the result of a tracking reception (second only)
+     * @param second Output: the current WWVB second (0-59) at the IRQ- falling edge
+     * @param antenna2Used Output (optional): true if Antenna 2 was used
+     * @param cachedStatus0 Pre-read Status 0 value (pass 0xFF to read it here)
+     * @return true if both RX_OK=1 and TRACKING=1 in Status 0
+     * @note Tracking mode only populates register 0x09 (Second). All other time
+     *       registers are cleared to 0x00 and must not be used.
+     */
+    bool readTrackingResult(uint8_t *second, bool *antenna2Used = nullptr,
+                            uint8_t cachedStatus0 = 0xFF);
     
     /**
      * @brief Read a single register
