@@ -1,0 +1,12 @@
+# PlatformIO build artifacts
+.pio/
+
+# VS Code
+.vscode/
+
+# Backup files
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
