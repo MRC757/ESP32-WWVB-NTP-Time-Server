@@ -1,6 +1,8 @@
 # WWVB Atomic Clock — ESP32-S3 with ES100 Receiver
 
 A precision atomic clock using the ESP32-S3 microcontroller with an Everset ES100 WWVB receiver module. Displays time synchronized with NIST's WWVB 60 kHz time signal broadcast from Fort Collins, Colorado. When connected to WiFi, it also operates as a **Stratum 1 NTP server** for your local network.
+<img width="1049" height="675" alt="Board" src="https://github.com/user-attachments/assets/5446def4-0a4c-4399-90ff-94bfeeb19bf8" />
+<img width="715" height="1437" alt="Web_GUI" src="https://github.com/user-attachments/assets/44bd8ee1-7c0b-4cfd-bed4-3cfceeb4ff68" />
 
 ## Display Library
 
