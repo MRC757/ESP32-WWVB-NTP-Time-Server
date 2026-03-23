@@ -400,3 +400,105 @@ An I2C address probe (address-only, no register read) was added before `es100.be
 **Document Version:** 1.1
 **Last Updated:** 2026-02-27
 **Modifications By:** Claude Code AI Assistant
+
+---
+
+## Date: 2026-03-23
+
+## 8. Fix Tracking Mode Reception Timeout
+
+**File:** `wwvb_clock.ino`
+**Issue:** Tracking mode syncs scheduled more than 30 seconds before the :55 boundary immediately timed out after the Control 0 register was written.
+
+**Root Cause:** `lastSyncAttempt` was set when the tracking sync was *scheduled* (which could be up to 60 seconds before :55), not when reception actually started. The 30-second `SYNC_TIMEOUT_TRACKING_MS` check fired the moment Control 0 was written if more than 30 seconds had elapsed since scheduling. Only syncs scheduled within 30 seconds of :55 could succeed.
+
+**Fix:** Reset `lastSyncAttempt = millis()` immediately after `es100.startReception()` succeeds at :55, matching the behavior of normal mode.
+
+---
+
+## 9. Fix Tracking Mode Antenna Selection
+
+**File:** `wwvb_clock.ino`
+**Issue:** Tracking mode always used Antenna 1 regardless of historical performance.
+
+**Fix:** Tracking mode now selects the antenna with the higher historical success count (same logic as normal mode):
+```cpp
+uint8_t trkCtrl = (ant2Successes > ant1Successes) ? ES100_CTRL0_TRACK_ANT2
+                                                   : ES100_CTRL0_TRACK_ANT1;
+```
+
+---
+
+## 10. Fix Normal Sync Web Callback Blocked by Pending Tracking
+
+**File:** `wwvb_clock.ino`
+**Issue:** Triggering a Normal Sync from the web interface was silently ignored when a tracking start was pending.
+
+**Root Cause:** The callback guarded with `if (!es100Receiving && !pendingTrackingStart)`, but `startWWVBSync()` already cancels pending tracking at its start — the guard was redundant and prevented the forced normal sync.
+
+**Fix:** Removed the `!pendingTrackingStart` guard from the web sync callback.
+
+---
+
+## 11. Fix ~1 Second Display Lag
+
+**File:** `wwvb_clock.ino` (`syncFromDS3231()`)
+**Issue:** The displayed time was consistently ~0.997 seconds behind NIST NTP.
+
+**Root Cause:** `syncFromDS3231()` compared TimeManager's second directly against the DS3231 register. `tick()` (millis-based) can increment the second up to a few milliseconds *before* the DS3231's register updates. The old condition fired on this 1-second mismatch and called `setTime()`, which rolled TimeManager back to the old second and reset `_accumMillis = 0`. This repeated every second, producing a consistent ~1-second display lag.
+
+**Fix:** Replace field-by-field comparison with a Unix timestamp diff. `setTime()` is now called only when the discrepancy is ≥ 2 seconds — genuine drift. A ±1 second difference is the normal tick/read race and is ignored.
+
+```cpp
+uint32_t rtcUnix = rtcTime.unixtime();
+uint32_t tmUnix  = timeManager.getUnixTime();
+int32_t  diff    = (int32_t)(rtcUnix - tmUnix);
+if (diff < -1 || diff > 1) {
+    timeManager.setTime(...);
+}
+```
+
+---
+
+## 12. Add +1 Second Latency Compensation
+
+**File:** `wwvb_clock.ino`
+**Issue:** After the display lag was fixed, the clock was still consistently 1 second slow vs. NIST NTP, due to ES100 frame processing delay, radio propagation, and display loop latency.
+
+**Fix:** Apply `+1` second to the Unix timestamp immediately after setting time from both WWVB (normal and tracking) and NTP sync paths. Measured accuracy after fix: approximately ±364 ms vs. NIST time.gov.
+
+---
+
+## 13. Fix Build Failure with ESP32 Arduino Core 3.x
+
+**File:** `platformio.ini`
+**Issue:** Build failed with `SPIFFS.h: No such file or directory` because `platform = espressif32` without a version pin pulled the latest release (Arduino core 3.x), where `SPIFFS.h` was removed from the core. Both `TFT_eSPI` and `LilyGo-AMOLED-Series` include it internally.
+
+**Fix:** Pin the platform to `espressif32@^6.9.0` (Arduino core 2.x) where `SPIFFS.h` is still bundled.
+
+---
+
+## 14. Add favicon.ico Handler
+
+**File:** `StatusServer.cpp`
+**Issue:** Browser requests for `/favicon.ico` triggered a spurious `[E][WebServer.cpp:638] _handleRequest(): request handler not found` error in the serial log on every page load.
+
+**Fix:** Added an explicit handler returning HTTP 204 No Content:
+```cpp
+_httpServer.on("/favicon.ico", HTTP_GET, [this]() { _httpServer.send(204); });
+```
+
+---
+
+## Files Modified (2026-03-23)
+
+- `wwvb_clock.ino` — tracking timeout, antenna selection, normal sync callback, display lag, latency compensation
+- `platformio.ini` — platform version pinned to `espressif32@^6.9.0`
+- `StatusServer.cpp` — favicon.ico handler
+- `README.md` — updated to reflect all 2026-03-23 changes
+
+---
+
+**Document Version:** 1.2
+**Last Updated:** 2026-03-23
+**Modifications By:** Claude Code AI Assistant
