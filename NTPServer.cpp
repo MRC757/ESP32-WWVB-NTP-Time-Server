@@ -11,7 +11,8 @@
 #define NTP_PACKET_SIZE 48
 
 NTPServer::NTPServer()
-    : _timeManager(nullptr), _running(false), _requestCount(0), _stratum(1) {
+    : _timeManager(nullptr), _running(false), _requestCount(0),
+      _stratum(1), _leapIndicator(0), _lastSyncUnixTime(0) {
     memcpy(_refId, "WWVB", 4);
 }
 
@@ -124,19 +125,19 @@ uint32_t NTPServer::getRequestCount() const {
 void NTPServer::buildResponse(const uint8_t* request, uint8_t* response) {
     memset(response, 0, NTP_PACKET_SIZE);
 
-    // Get current time as NTP timestamp
-    uint32_t ntpNow = unixToNTP(_timeManager->getUnixTime());
-
-    // Sub-second fraction: convert milliseconds (0-999) to NTP fraction (0-2^32)
-    // fraction ≈ ms * 4294967 (approximates ms/1000 * 2^32)
-    uint16_t ms = _timeManager->getMilliseconds();
+    // Atomically sample seconds + milliseconds — avoids second-boundary race where
+    // getUnixTime() and getMilliseconds() could straddle a tick() call.
+    uint32_t unixNow;
+    uint16_t ms;
+    _timeManager->getTimeSnapshot(unixNow, ms);
+    uint32_t ntpNow      = unixToNTP(unixNow);
     uint32_t ntpFraction = (uint32_t)ms * 4294967UL;
 
     // Byte 0: LI (2 bits) + VN (3 bits) + Mode (3 bits)
-    // Echo client's version number per RFC 5905 — Windows sends v3, others may send v4
+    // LI reflects the leap-second warning decoded from the WWVB frame (RFC 5905).
     uint8_t clientVersion = (request[0] >> 3) & 0x07;
     if (clientVersion < 3) clientVersion = 3;  // Floor at NTPv3
-    response[0] = (clientVersion << 3) | 0x04;  // LI=0 + client's VN + Mode=4 (server)
+    response[0] = (_leapIndicator << 6) | (clientVersion << 3) | 0x04;
 
     // Byte 1: Stratum (1=primary/WWVB, 2=NTP-synced)
     response[1] = _stratum;
@@ -150,17 +151,28 @@ void NTPServer::buildResponse(const uint8_t* request, uint8_t* response) {
     // Bytes 4-7: Root Delay = 0 (primary reference clock)
     // Already zeroed by memset
 
-    // Bytes 8-11: Root Dispersion (NTP fixed-point 16.16)
-    // ~15.26ms = 0x000003E8 — reasonable for millis()-based clock with WWVB sync
-    writeUint32(&response[8], 0x000003E8);
+    // Bytes 8-11: Root Dispersion — grows at DS3231 drift rate since last sync.
+    // NTP fixed-point 16.16: integer part in upper 16 bits, fraction in lower 16 bits.
+    uint32_t dispersion = NTP_MIN_DISPERSION;
+    if (_lastSyncUnixTime > 0 && unixNow > _lastSyncUnixTime) {
+        uint32_t ageSec = unixNow - _lastSyncUnixTime;
+        // drift = ageSec * ppm / 1,000,000  →  fixed-point 16.16
+        uint32_t driftFixed = (uint32_t)((uint64_t)ageSec * NTP_DS3231_DRIFT_PPM
+                                         * 65536ULL / 1000000ULL);
+        dispersion = NTP_MIN_DISPERSION + driftFixed;
+        if (dispersion > NTP_MAX_DISPERSION) dispersion = NTP_MAX_DISPERSION;
+    }
+    writeUint32(&response[8], dispersion);
 
     // Bytes 12-15: Reference ID
     memcpy(&response[12], _refId, 4);
 
-    // Bytes 16-23: Reference Timestamp (last time clock was synced)
-    // Use current time as approximation (fraction=0, sync precision is 1s)
-    writeUint32(&response[16], ntpNow);  // Seconds
-    writeUint32(&response[20], 0);        // Fraction
+    // Bytes 16-23: Reference Timestamp — time of most recent clock sync (RFC 5905 §7.3)
+    uint32_t refNTP = (_lastSyncUnixTime > 0)
+                      ? unixToNTP(_lastSyncUnixTime)
+                      : ntpNow;  // Fallback to now if sync time not yet recorded
+    writeUint32(&response[16], refNTP);
+    writeUint32(&response[20], 0);        // Fraction: 1-second sync precision
 
     // Bytes 24-31: Origin Timestamp = client's Transmit Timestamp
     // Copy bytes 40-47 from the request
@@ -205,4 +217,12 @@ void NTPServer::setStratum(uint8_t stratum, IPAddress refIP) {
     _refId[1] = refIP[1];
     _refId[2] = refIP[2];
     _refId[3] = refIP[3];
+}
+
+void NTPServer::setLastSyncTime(uint32_t unixTime) {
+    _lastSyncUnixTime = unixTime;
+}
+
+void NTPServer::setLeapIndicator(uint8_t li) {
+    _leapIndicator = li & 0x03;
 }

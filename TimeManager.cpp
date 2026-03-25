@@ -78,6 +78,36 @@ void TimeManager::setUnixTime(uint32_t unixTime) {
     setTime(year, month, day, hour, minute, second);
 }
 
+void TimeManager::setUnixTimePreserveMillis(uint32_t unixTime) {
+    // Decompose Unix time into calendar fields without touching _accumMillis/_lastTickMillis.
+    // Sub-second phase is preserved from the last full sync.
+    uint32_t seconds = unixTime;
+    uint16_t year = 1970;
+    while (true) {
+        uint32_t siy = isLeapYear(year) ? 366UL * 86400UL : 365UL * 86400UL;
+        if (seconds < siy) break;
+        seconds -= siy;
+        year++;
+    }
+    uint8_t month = 1;
+    while (month <= 12) {
+        uint32_t sim = (uint32_t)daysInMonth(year, month) * 86400UL;
+        if (seconds < sim) break;
+        seconds -= sim;
+        month++;
+    }
+    _year   = year;
+    _month  = month;
+    _day    = 1 + (seconds / 86400);
+    seconds %= 86400;
+    _hour   = seconds / 3600;
+    seconds %= 3600;
+    _minute = seconds / 60;
+    _second = seconds % 60;
+    // _accumMillis and _lastTickMillis intentionally NOT touched —
+    // sub-second phase is preserved from the last full sync.
+}
+
 // ============================================================================
 // Time Retrieval
 // ============================================================================
@@ -170,6 +200,18 @@ uint16_t TimeManager::getMilliseconds() {
     if (!_timeSet) return 0;
     unsigned long elapsed = millis() - _lastTickMillis;
     return (uint16_t)((_accumMillis + elapsed) % 1000);
+}
+
+void TimeManager::getTimeSnapshot(uint32_t& outUnixSeconds, uint16_t& outMillis) {
+    // Sample ms, then seconds. If ms wrapped downward between the two reads,
+    // a second boundary passed — re-read seconds for a coherent pair.
+    outMillis      = getMilliseconds();
+    outUnixSeconds = getUnixTime();
+    uint16_t ms2   = getMilliseconds();
+    if (ms2 < outMillis) {
+        outUnixSeconds = getUnixTime();
+        outMillis      = ms2;
+    }
 }
 
 bool TimeManager::isTimeSet() {

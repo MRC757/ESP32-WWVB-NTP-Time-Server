@@ -59,13 +59,28 @@ public:
      */
     void setStratum(uint8_t stratum, IPAddress refIP);
 
+    /**
+     * @brief Record the Unix time of the most recent clock sync for dispersion calculation.
+     * @param unixTime  Unix timestamp of the sync event
+     */
+    void setLastSyncTime(uint32_t unixTime);
+
+    /**
+     * @brief Set the RFC 5905 Leap Indicator for NTP responses.
+     * @param li  0=no warning, 1=last minute has 61 seconds,
+     *            2=last minute has 59 seconds, 3=alarm/unsynchronized
+     */
+    void setLeapIndicator(uint8_t li);
+
 private:
     WiFiUDP _udp;
     TimeManager* _timeManager;
     bool _running;
     uint32_t _requestCount;
     uint8_t _stratum;
-    char _refId[4];
+    char     _refId[4];
+    uint8_t  _leapIndicator;     // 0=none, 1=+1s, 2=-1s, 3=unsynchronized (RFC 5905)
+    uint32_t _lastSyncUnixTime;  // Unix time of last sync, for dispersion growth and reference timestamp
 
     /**
      * @brief Build a 48-byte NTP response packet

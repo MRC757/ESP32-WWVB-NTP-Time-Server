@@ -69,12 +69,14 @@ Preferences preferences;
 // State Variables
 // ============================================================================
 volatile bool es100InterruptFlag = false;
+volatile unsigned long es100IRQMillis = 0;   // millis() captured at ISR fire
 bool es100Receiving = false;
 bool es100Available = false;
 bool es100TrackingReady = false;        // True after a successful normal-mode decode
 bool es100UsingTracking = false;        // True if current attempt is tracking mode
 bool pendingTrackingStart = false;      // True when waiting to write Control 0 at second :55
 unsigned long trackingStartAtMs = 0;   // millis() target for the Control 0 write
+uint32_t trackingWriteUnixTime = 0;    // Unix time when Control 0 was written at :55
 unsigned long es100TrackingReadySinceMs = 0; // millis() when es100TrackingReady was last set
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastSyncAttempt = 0;
@@ -115,7 +117,8 @@ uint8_t critBattCount = 0;              // Consecutive critical-battery readings
 // Time source tracking
 enum TimeSource { TIME_SRC_NONE, TIME_SRC_RTC, TIME_SRC_NTP, TIME_SRC_WWVB };
 TimeSource lastTimeSource = TIME_SRC_NONE;
-unsigned long lastTimeSyncMillis = 0;  // millis() when last synced
+unsigned long lastTimeSyncMillis  = 0;  // millis() when last synced (any source)
+unsigned long lastWWVBSyncMillis  = 0;  // millis() when last synced from WWVB
 
 // Display regions (will be calculated based on display height)
 uint16_t CLOCK_Y;
@@ -226,7 +229,8 @@ static const char KB_ROW3_SYM[]   = ")-_+=[]";
 // Interrupt Service Routine
 // ============================================================================
 void IRAM_ATTR es100ISR() {
-    es100InterruptFlag = true;
+    es100IRQMillis = millis();    // Capture time at IRQ edge (IRAM-safe on ESP32)
+    es100InterruptFlag = true;    // Set flag after timestamp for ordering guarantee
 }
 
 // ============================================================================
@@ -1943,6 +1947,14 @@ void syncFromDS3231() {
         return;
     }
 
+    // Suppress DS3231 corrections for WWVB_SYNC_TRUST_WINDOW_MS after a WWVB sync.
+    // Allows the DS3231 I2C write and its own 1Hz tick to settle before we read back.
+    // After the window expires, DS3231 resumes as the normal drift-correction source.
+    if (lastWWVBSyncMillis > 0 &&
+        (millis() - lastWWVBSyncMillis) < WWVB_SYNC_TRUST_WINDOW_MS) {
+        return;
+    }
+
     // Read DS3231 as the authoritative time source every call
     // The DS3231 TCXO is ±2 ppm vs ESP32 crystal at ±20 ppm
     DateTime rtcTime = rtc.now();
@@ -1961,8 +1973,9 @@ void syncFromDS3231() {
     uint32_t tmUnix  = timeManager.getUnixTime();
     int32_t  diff    = (int32_t)(rtcUnix - tmUnix);
     if (diff < -1 || diff > 1) {
-        timeManager.setTime(rtcTime.year(), rtcTime.month(), rtcTime.day(),
-                           rtcTime.hour(), rtcTime.minute(), rtcTime.second());
+        // Use the preserve-millis variant so DS3231 drift corrections do not
+        // reset the sub-second accumulator that feeds NTP fractional timestamps.
+        timeManager.setUnixTimePreserveMillis(rtcUnix);
     }
 }
 
@@ -2013,6 +2026,7 @@ bool ntpClientSync() {
     }
     udp.write(packet, 48);
     udp.endPacket();
+    unsigned long t1 = millis();  // T1: approximate send time (just after endPacket)
 
     // Wait for response (up to 2 seconds)
     unsigned long start = millis();
@@ -2025,28 +2039,34 @@ bool ntpClientSync() {
         }
         delay(10);
     }
+    unsigned long t4 = millis();  // T4: response received
 
     // Read response
     udp.read(packet, 48);
     udp.stop();
 
-    // Extract transmit timestamp (bytes 40-43, big-endian NTP seconds)
-    uint32_t ntpSeconds = ((uint32_t)packet[40] << 24) |
-                          ((uint32_t)packet[41] << 16) |
-                          ((uint32_t)packet[42] << 8)  |
-                          (uint32_t)packet[43];
+    // Extract T3 (server transmit timestamp, bytes 40-43)
+    uint32_t t3_ntp = ((uint32_t)packet[40] << 24) |
+                      ((uint32_t)packet[41] << 16) |
+                      ((uint32_t)packet[42] << 8)  |
+                      (uint32_t)packet[43];
 
-    if (ntpSeconds == 0) {
+    if (t3_ntp == 0) {
         Serial.println("[NTP-CLIENT] Invalid response (zero timestamp)");
         return false;
     }
 
     // Convert NTP timestamp (since 1900) to Unix timestamp (since 1970)
-    uint32_t unixTime = ntpSeconds - NTP_EPOCH_OFFSET;
+    uint32_t unixTime = t3_ntp - NTP_EPOCH_OFFSET;
 
-    // Set TimeManager and DS3231
-    // +1s: compensates for NTP packet processing + display loop latency
-    timeManager.setUnixTime(unixTime + 1);
+    // RTT compensation: apply half the measured round-trip as a one-way delay offset.
+    // No minimum 1s floor — NTP delivers accurate time without WWVB pipeline delay.
+    // For sub-second LAN RTTs offsetSec = 0 (correct); only WAN RTTs > 2s get +1s.
+    unsigned long rttMs = t4 - t1;
+    uint32_t offsetSec  = (uint32_t)((rttMs / 2 + 500) / 1000);
+    timeManager.setUnixTime(unixTime + offsetSec);
+    Serial.printf("[NTP-CLIENT] RTT=%lums, applied offset=%lus\n",
+                  (unsigned long)rttMs, (unsigned long)offsetSec);
     saveTimeToDS3231();
 
     // Track time source — NTP is Stratum 2
@@ -2055,6 +2075,7 @@ bool ntpClientSync() {
     lastTimeSyncMillis = millis();
     snapshotSyncTime();
     ntpServer.setStratum(2, ntpServerIP);
+    ntpServer.setLastSyncTime(timeManager.getUnixTime());
     captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
     // Recompute DST from calendar after NTP time update
@@ -2267,7 +2288,12 @@ void startWWVBSync(bool forceNormal = false) {
 
     es100UsingTracking = false;
 
-    if (!forceNormal && ES100_USE_TRACKING && es100TrackingReady) {
+    // Only use tracking mode if the clock is fresh enough that second :55 scheduling
+    // is accurate. DS3231 at 2 ppm drifts ~173 ms/day; 5 days = ~865 ms worst case,
+    // still within the ±4s tolerance of tracking mode.
+    bool clockFreshEnoughForTracking =
+        (timeManager.getSecondsSinceSync() < 432000UL);  // 5 days
+    if (!forceNormal && ES100_USE_TRACKING && es100TrackingReady && clockFreshEnoughForTracking) {
         if (millis() - es100TrackingReadySinceMs >= ES100_TRACKING_FALLBACK_MS) {
             Serial.println("[WWVB] Tracking mode expired (7 days), switching to normal mode");
             es100TrackingReady = false;
@@ -2318,9 +2344,13 @@ void stopWWVBSync() {
 
 void handleES100Interrupt() {
     if (!es100InterruptFlag || !es100Receiving) return;
-    
+
     es100InterruptFlag = false;
-    
+    unsigned long irqFiredAt         = es100IRQMillis;
+    unsigned long irqProcessingDelay = millis() - irqFiredAt;
+    // Clamp: defend against millis() wrap or a stale IRQMillis from a prior cycle
+    if (irqProcessingDelay > 10000UL) irqProcessingDelay = 0UL;
+
     uint8_t irqStatus = es100.readIRQStatus();
     Serial.printf("ES100 IRQ Status: 0x%02X\n", irqStatus);
     
@@ -2339,20 +2369,47 @@ void handleES100Interrupt() {
                 // Tracking mode: only register 0x09 (Second) is valid.
                 // Year/Month/Day/Hour/Minute are cleared to 0x00 by the START write
                 // and must NOT be used — doing so would corrupt the RTC with year 2000.
-                // Instead, snap only the seconds field of the current RTC time.
+                // Instead, back-compute the correct Unix second from the IRQ timestamp.
                 uint8_t wwvbSecond;
                 if (es100.readTrackingResult(&wwvbSecond, &ant2Used, status0)) {
+                    // Apply correction FIRST to minimise IRQ→setTime latency.
+                    // Back-compute time at IRQ fire moment, then patch WWVB second.
+                    uint32_t timeAtIRQ  = timeManager.getUnixTime()
+                                         - (irqProcessingDelay / 1000UL);
+                    uint32_t minuteBase = (timeAtIRQ / 60UL) * 60UL;
+                    uint32_t corrected  = minuteBase + wwvbSecond;
+                    // Resolve minute-boundary ambiguity: pick the minute closest to timeAtIRQ
+                    int32_t delta = (int32_t)(corrected - timeAtIRQ);
+                    if (delta >  30) corrected -= 60UL;
+                    if (delta < -30) corrected += 60UL;
+
+                    // Sanity check: corrected time should be 10–35 s after the :55 write.
+                    // Guards against the clock being ~60s off (delta=0 passes ±30s check
+                    // but lands in the wrong minute).
+                    bool sanityOk = true;
+                    if (trackingWriteUnixTime > 0) {
+                        int32_t elapsed = (int32_t)(corrected - trackingWriteUnixTime);
+                        if (elapsed < 10 || elapsed > 35) {
+                            Serial.printf("[WWVB] Tracking sanity FAIL: elapsed=%ds from :55 write (expected 10-35) — rejected\n",
+                                          elapsed);
+                            sanityOk = false;
+                        }
+                    }
+
+                    if (sanityOk) {
+                        timeManager.setUnixTime(corrected);
+                        syncOk = true;
+                    }
+
+                    // Log AFTER correction so timestamp in message is accurate
                     ClockTime cur = timeManager.getUTCTime();
-                    Serial.printf("Tracking snap: RTC was %04d-%02d-%02d %02d:%02d:%02d, "
+                    Serial.printf("Tracking snap: IRQ delay=%lums, corrected to "
+                                  "%04d-%02d-%02d %02d:%02d:%02d UTC, "
                                   "WWVB second=%02d (Ant%d)\n",
+                                  irqProcessingDelay,
                                   cur.year, cur.month, cur.day,
                                   cur.hour, cur.minute, cur.second,
                                   wwvbSecond, ant2Used ? 2 : 1);
-                    timeManager.setTime(cur.year, cur.month, cur.day,
-                                        cur.hour, cur.minute, wwvbSecond);
-                    // +1s: compensates for ES100 processing + radio propagation delay
-                    timeManager.setUnixTime(timeManager.getUnixTime() + 1);
-                    syncOk = true;
                 } else {
                     Serial.println("Failed to read tracking result");
                 }
@@ -2360,13 +2417,14 @@ void handleES100Interrupt() {
                 // Normal 1-minute frame: all time registers are valid
                 ES100Time rxTime;
                 if (es100.readDateTime(&rxTime)) {
-                    Serial.printf("Received UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-                                 rxTime.year, rxTime.month, rxTime.day,
-                                 rxTime.hour, rxTime.minute, rxTime.second);
+                    // Apply correction FIRST (before any Serial output) to minimise
+                    // the gap between irqFiredAt and when the clock is actually set.
                     timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
                                        rxTime.hour, rxTime.minute, rxTime.second);
-                    // +1s: compensates for ES100 processing + radio propagation delay
-                    timeManager.setUnixTime(timeManager.getUnixTime() + 1);
+                    // Compensate for measured IRQ→processing delay (replaces fixed +1s)
+                    uint32_t delaySeconds = (irqProcessingDelay + 500UL) / 1000UL;
+                    if (delaySeconds == 0) delaySeconds = 1;  // minimum 1s floor for ES100 pipeline
+                    timeManager.setUnixTime(timeManager.getUnixTime() + delaySeconds);
 
                     // DST only comes from normal mode (tracking does not provide it)
                     uint8_t dstBits = (status0 >> 5) & 0x03;
@@ -2376,12 +2434,21 @@ void handleES100Interrupt() {
                     uint8_t lsw = (status0 & ES100_STATUS_LSW_MASK) >> 3;
                     if (lsw != wwvbLeapSecondWarning) {
                         wwvbLeapSecondWarning = lsw;
+                        ntpServer.setLeapIndicator(lsw);  // propagate to NTP (RFC 5905)
                         if (lsw) Serial.printf("[WWVB] Leap second warning: %s\n",
                                                lsw == 1 ? "+1s end of month" : "-1s end of month");
                     }
 
                     ant2Used = rxTime.antenna2Used;
                     syncOk = true;
+
+                    // Log AFTER correction so timestamp in message is accurate
+                    Serial.printf("Normal sync: IRQ delay=%lums, set to %04d-%02d-%02d "
+                                  "%02d:%02d:%02d UTC (Ant%d)\n",
+                                  irqProcessingDelay,
+                                  rxTime.year, rxTime.month, rxTime.day,
+                                  rxTime.hour, rxTime.minute, rxTime.second,
+                                  rxTime.antenna2Used ? 2 : 1);
                 } else {
                     Serial.println("Failed to read time data");
                 }
@@ -2399,10 +2466,13 @@ void handleES100Interrupt() {
                 saveTimeToDS3231();  // Also update RTC
 
                 // Track time source
-                lastTimeSource = TIME_SRC_WWVB;
+                lastTimeSource     = TIME_SRC_WWVB;
                 lastTimeSyncMillis = millis();
+                lastWWVBSyncMillis = millis();
                 snapshotSyncTime();
                 ntpServer.setStratum(1, "WWVB");
+                ntpServer.setLastSyncTime(timeManager.getUnixTime());
+                if (!wwvbLeapSecondWarning) ntpServer.setLeapIndicator(0);
                 captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
                 // Enable tracking mode for subsequent syncs
@@ -2687,6 +2757,14 @@ void loop() {
         timeManager.tick();
         syncFromDS3231();  // Read DS3231 as authoritative time source
 
+        // Degrade NTP stratum to 16 if too long without any sync (RFC 5905 §7.3)
+        if (timeManager.isTimeSet() &&
+            timeManager.getSecondsSinceSync() > NTP_UNSYNC_STRATUM_THRESHOLD_S) {
+            if (ntpServer.isRunning()) {
+                ntpServer.setStratum(16, "LOCL");
+            }
+        }
+
         // Read DS3231 temperature every 64 seconds (matches sensor update rate)
         if (millis() - lastTempRead >= 64000) {
             readDS3231Temperature();
@@ -2781,6 +2859,7 @@ void loop() {
             if (es100.startReception(trkCtrl)) {
                 es100Receiving = true;
                 lastSyncAttempt = millis();  // Reset timeout clock from actual start, not schedule time
+                trackingWriteUnixTime = timeManager.getUnixTime();  // Anchor for sanity check
                 Serial.printf("[WWVB] Tracking mode sync started at :55 (Ant%d, successes: Ant1=%d Ant2=%d)\n",
                               (ant2Successes > ant1Successes) ? 2 : 1, ant1Successes, ant2Successes);
             } else {

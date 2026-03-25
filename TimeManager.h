@@ -85,12 +85,28 @@ public:
      * @return Milliseconds (0-999)
      */
     uint16_t getMilliseconds();
+
+    /**
+     * @brief Get a coherent (seconds, milliseconds) pair, safe against second-boundary races.
+     * @param outUnixSeconds  Output: current Unix timestamp (integer seconds)
+     * @param outMillis       Output: milliseconds within the current second (0–999)
+     */
+    void getTimeSnapshot(uint32_t& outUnixSeconds, uint16_t& outMillis);
     
     /**
      * @brief Set time from Unix timestamp
      * @param unixTime Seconds since Jan 1, 1970
      */
     void setUnixTime(uint32_t unixTime);
+
+    /**
+     * @brief Correct the integer second without disturbing the sub-second accumulator.
+     * @details Use this for DS3231 drift corrections where only the integer second changes.
+     *          Unlike setUnixTime(), this does NOT reset _accumMillis or _lastTickMillis,
+     *          preserving the NTP fractional-second accuracy accumulated since the last sync.
+     * @param unixTime  The corrected Unix timestamp (integer seconds)
+     */
+    void setUnixTimePreserveMillis(uint32_t unixTime);
     
     /**
      * @brief Check if time has been set (synced at least once)
@@ -143,7 +159,7 @@ private:
     bool _timeSet;                      // Has time been set?
     
     // Accumulated milliseconds for sub-second accuracy
-    uint16_t _accumMillis;
+    uint32_t _accumMillis;   // uint32 prevents overflow up to ~49 days
     
     /**
      * @brief Increment internal time by one second

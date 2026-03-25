@@ -241,4 +241,33 @@
 // Low battery serial warning interval (milliseconds)
 #define LOW_BATTERY_WARN_MS     60000
 
+// ============================================================================
+// WWVB SYNC TRUST WINDOW
+// ============================================================================
+
+// Duration (ms) to suppress DS3231 read-back after a WWVB sync.
+// Prevents the DS3231's own 1Hz register boundary from overwriting a fresh WWVB correction.
+#define WWVB_SYNC_TRUST_WINDOW_MS        10000UL
+
+// ============================================================================
+// NTP SERVER QUALITY PARAMETERS
+// ============================================================================
+
+// DS3231 maximum drift rate (ppm) — used to compute NTP Root Dispersion growth.
+// Datasheet spec is ±2 ppm; use 2 as the conservative drift rate.
+#define NTP_DS3231_DRIFT_PPM             2UL
+
+// Minimum root dispersion when clock was just synced (NTP fixed-point 16.16 seconds).
+// 0x000003E8 ≈ 0.015 s (15 ms) — reflects millis()-based timekeeping resolution.
+#define NTP_MIN_DISPERSION               0x000003E8UL
+
+// Maximum root dispersion cap (NTP fixed-point 16.16).
+// 0x00010000 = 1.0 s — cap prevents dispersion from growing unreasonably large.
+#define NTP_MAX_DISPERSION               0x00010000UL
+
+// Seconds without any sync before the NTP server degrades to Stratum 16.
+// 48 hours: DS3231 at 2 ppm drifts ~345 ms/day — still within 1 s, but advertising
+// Stratum 1 beyond 48 h without a reference is misleading per RFC 5905.
+#define NTP_UNSYNC_STRATUM_THRESHOLD_S   172800UL
+
 #endif // CONFIG_H
