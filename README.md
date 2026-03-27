@@ -59,7 +59,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 | 60 kHz Ferrite Bar Antenna | WWVB receive antenna (1 or 2 supported) |
 | DS3231 RTC Module | I2C real-time clock (optional but recommended) |
 
-The ES100 module typically requires an external 16 MHz crystal — check your specific module's datasheet.
+The ES100 chip requires an external 16 MHz crystal for its internal oscillator. The official **ES100-MOD** module includes this crystal onboard. Third-party breakout boards may omit it — check your specific module before assuming the crystal is present.
 
 ### Wiring
 
@@ -362,6 +362,41 @@ Normal behavior. The ESP32-S3 crystal has ~20 ppm accuracy. The DS3231 RTC has ~
 | Tracking schedule delay | 0–60 seconds | Time until the next :55 boundary |
 
 **Tracking mode timing:** The ES100 datasheet requires the Control 0 register write at exactly second :55 (±4 s drift tolerance) so that the 22-second reception window captures the WWVB frame sync word. The firmware computes the time until the next :55 boundary and schedules the write non-blocking, powering the ES100 on ~50 ms early to satisfy the wakeup requirement. The 30-second reception timeout is measured from the moment the Control 0 register is written at :55, not from when the sync was scheduled. After the IRQ fires, the correct Unix second is back-computed from the :55 write timestamp plus the WWVB seconds field; a sanity check confirms the result falls 10–35 s after the write before the correction is applied.
+
+### Time Accuracy Chain
+
+Each stage in the path from the WWVB signal to a client clock introduces error. Understanding each stage helps set realistic expectations and identify where improvement is possible.
+
+```
+WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser → time.gov
+```
+
+| Stage | Typical Error | Notes |
+|-------|--------------|-------|
+| WWVB signal (NIST) | < 1 µs | Primary UTC reference; error is negligible |
+| ES100 decode + IRQ latency | < 1 ms | Firmware measures and compensates IRQ delay; tracking back-computes from :55 write timestamp |
+| DS3231 holdover (daytime) | < 120 ms | ~2 ppm drift over up to 16 h of daytime (no WWVB reception). Resets each night when WWVB syncs resume |
+| ESP32 WiFi NTP response | 40–80 ms jitter | WiFi adds variable one-way latency. NTP timestamps are captured before transmission; client RTT/2 compensation removes the constant part but not the jitter |
+| **NTP client poll interval** | **0 ms – seconds** | **Largest controllable error.** Windows default can poll as infrequently as every 9 hours, allowing the PC clock to drift by seconds. For a local NTP server, reduce to 64–1024 s (see below) |
+| time.gov browser measurement | 50–100 ms floor | JavaScript timer resolution (~15 ms on Windows) plus internet RTT to time.gov servers. Differences smaller than ~100 ms may be within measurement noise |
+
+**Overall accuracy to UTC when everything is working:**
+- NTP server vs. UTC: < 120 ms (limited by DS3231 daytime holdover)
+- PC clock vs. NTP server: < 50 ms after a recent poll (limited by WiFi jitter)
+- Visible on time.gov: ± 50–200 ms (limited by browser measurement floor)
+
+#### Recommended Windows NTP client settings for a local server
+
+The default Windows NTP configuration polls as infrequently as every 9 hours, which allows the PC clock to drift by seconds between polls. Run these commands in an elevated command prompt to poll every 64–1024 seconds instead:
+
+```
+w32tm /config /manualpeerlist:"<device-ip>,0x8" /syncfromflags:manual /update
+w32tm /config /MinPollInterval:6 /MaxPollInterval:10 /update
+net stop w32tm && net start w32tm
+w32tm /resync /force
+```
+
+Replace `<device-ip>` with the clock's IP address. The `0x8` flag selects NTP client mode without the SpecialPollInterval override. After these changes, `w32tm /query /status` should show `Poll Interval: 6 (64s)` growing toward `10 (1024s)` as the source stabilises.
 
 ### Power Consumption (ES100)
 
