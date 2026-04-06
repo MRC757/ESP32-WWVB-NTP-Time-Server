@@ -107,6 +107,7 @@ public:
      * @param unixTime  The corrected Unix timestamp (integer seconds)
      */
     void setUnixTimePreserveMillis(uint32_t unixTime);
+
     
     /**
      * @brief Check if time has been set (synced at least once)

@@ -119,6 +119,7 @@ enum TimeSource { TIME_SRC_NONE, TIME_SRC_RTC, TIME_SRC_NTP, TIME_SRC_WWVB };
 TimeSource lastTimeSource = TIME_SRC_NONE;
 unsigned long lastTimeSyncMillis  = 0;  // millis() when last synced (any source)
 unsigned long lastWWVBSyncMillis  = 0;  // millis() when last synced from WWVB
+unsigned long lastNormalSuccessMillis = 0;  // millis() of last successful normal-mode sync
 
 // Display regions (will be calculated based on display height)
 uint16_t CLOCK_Y;
@@ -2288,6 +2289,24 @@ void startWWVBSync(bool forceNormal = false) {
 
     es100UsingTracking = false;
 
+    // Nightly normal-mode anchor: force a full-frame sync at the start of each night
+    // (10 PM local) and retry every hour until one succeeds.  Tracking mode cannot
+    // self-correct errors larger than the ES100's ±4 s timing tolerance; once the clock
+    // drifts outside that window, every tracking sync perpetuates the error.  One
+    // successful full-frame decode per night re-anchors absolute time and breaks the cycle.
+    if (!forceNormal && isNighttimeWindow()) {
+        bool needsAnchor = (lastNormalSuccessMillis == 0) ||
+                           (millis() - lastNormalSuccessMillis >=
+                            NIGHTLY_NORMAL_SYNC_HOURS * 3600000UL);
+        if (needsAnchor) {
+            forceNormal = true;
+            unsigned long hoursAgo = lastNormalSuccessMillis == 0 ? 999UL
+                                     : (millis() - lastNormalSuccessMillis) / 3600000UL;
+            Serial.printf("[WWVB] Nightly anchor required (%luh since last full sync) — forcing normal mode\n",
+                          hoursAgo);
+        }
+    }
+
     // Only use tracking mode if the clock is fresh enough that second :55 scheduling
     // is accurate. DS3231 at 2 ppm drifts ~173 ms/day; 5 days = ~865 ms worst case,
     // still within the ±4s tolerance of tracking mode.
@@ -2421,10 +2440,12 @@ void handleES100Interrupt() {
                     // the gap between irqFiredAt and when the clock is actually set.
                     timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
                                        rxTime.hour, rxTime.minute, rxTime.second);
-                    // Compensate for measured IRQ→processing delay (replaces fixed +1s)
+                    // Compensate for measured IRQ→processing delay.
+                    // Rounds to the nearest whole second; sub-second pipeline delay
+                    // (~350 ms) is accepted as residual error until calibrated.
                     uint32_t delaySeconds = (irqProcessingDelay + 500UL) / 1000UL;
-                    if (delaySeconds == 0) delaySeconds = 1;  // minimum 1s floor for ES100 pipeline
-                    timeManager.setUnixTime(timeManager.getUnixTime() + delaySeconds);
+                    if (delaySeconds > 0)
+                        timeManager.setUnixTime(timeManager.getUnixTime() + delaySeconds);
 
                     // DST only comes from normal mode (tracking does not provide it)
                     uint8_t dstBits = (status0 >> 5) & 0x03;
@@ -2469,6 +2490,7 @@ void handleES100Interrupt() {
                 lastTimeSource     = TIME_SRC_WWVB;
                 lastTimeSyncMillis = millis();
                 lastWWVBSyncMillis = millis();
+                if (!usedTracking) lastNormalSuccessMillis = millis();
                 snapshotSyncTime();
                 ntpServer.setStratum(1, "WWVB");
                 ntpServer.setLastSyncTime(timeManager.getUnixTime());

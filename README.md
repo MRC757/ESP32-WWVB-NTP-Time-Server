@@ -23,6 +23,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Automatic DST Handling**: Uses DST data from the ES100 signal; adjustable in config
 - **Adaptive Sync Schedule**: 5-minute attempts until first lock; 1-hour at night (best propagation); 4-hour during the day
 - **Tracking Mode**: After the first successful normal-mode sync, subsequent syncs use ES100 tracking mode (~24.5 s vs ~134 s). Tracking decodes only the WWVB sync word to snap the seconds field with ±4 s tolerance. The Control 0 register write must occur at second :55 of any minute; the firmware schedules this non-blocking via the main loop. Tracking uses the same antenna selected by historical success counts as normal mode. Falls back to normal mode after 7 days without a full sync. A sanity check validates that the decoded result falls 10–35 s after the :55 write; results outside this window are rejected to prevent applying the correction to the wrong minute when the clock is significantly off.
+- **Nightly Normal-Mode Anchor**: Tracking mode cannot self-correct clock errors larger than the ES100's ±4 s timing tolerance — once the clock drifts outside that window, each tracking sync perpetuates rather than corrects the error. To prevent this, the firmware forces a full normal-mode sync at the start of each night (10 PM local) and retries every hour until one succeeds. After a successful full-frame decode, tracking mode resumes for the rest of the night.
 - **Leap Second Detection**: The WWVB signal carries a leap second warning in the week(s) before a scheduled UTC adjustment. The firmware extracts this from the ES100 Status 0 register (bits 3:4) and displays it on the web dashboard.
 - **Antenna Performance Tracking**: Per-antenna success counts are accumulated across reboots (NVS). Both normal-mode and tracking-mode syncs automatically use the antenna with the higher historical success count.
 - **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a whole-second correction (minimum 1 s floor for the ES100 pipeline) during normal-mode WWVB syncs. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. NTP client syncs apply half the measured round-trip time; sub-second LAN RTTs result in a 0 s offset, eliminating per-reboot accumulation.
@@ -163,9 +164,12 @@ The UTC offset can also be changed at runtime from the web dashboard (Settings p
 #define ES100_USE_TRACKING          true           // Enable tracking mode after first sync
 #define ES100_TRACKING_FALLBACK_MS  604800000UL    // Fall back to normal mode after 7 days
 #define TRACKING_PENDING_TIMEOUT_MS 65000UL        // Max wait for :55 boundary (60 s + 5 s margin)
+#define NIGHTLY_NORMAL_SYNC_HOURS   20UL           // Force normal mode if no full sync in this many hours
 ```
 
 Tracking mode is enabled automatically after any successful normal-mode reception and persists for up to 7 days. Set `ES100_USE_TRACKING false` to always use normal mode.
+
+Each night at 10 PM, the firmware forces a full normal-mode sync if no successful full-frame decode has occurred in the past `NIGHTLY_NORMAL_SYNC_HOURS` (default 20). Normal mode is retried every hour until it succeeds, then tracking resumes. This prevents tracking mode from perpetuating clock errors that exceed the ES100's ±4 s timing tolerance.
 
 ### Display
 
@@ -375,7 +379,7 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 |-------|--------------|-------|
 | WWVB signal (NIST) | < 1 µs | Primary UTC reference; error is negligible |
 | ES100 decode + IRQ latency | < 1 ms | Firmware measures and compensates IRQ delay; tracking back-computes from :55 write timestamp |
-| DS3231 holdover (daytime) | < 120 ms | ~2 ppm drift over up to 16 h of daytime (no WWVB reception). Resets each night when WWVB syncs resume |
+| DS3231 holdover (daytime) | < 120 ms | ~2 ppm drift over up to 16 h of daytime (no WWVB reception). Resets each night when a normal-mode anchor sync succeeds |
 | ESP32 WiFi NTP response | 40–80 ms jitter | WiFi adds variable one-way latency. NTP timestamps are captured before transmission; client RTT/2 compensation removes the constant part but not the jitter |
 | **NTP client poll interval** | **0 ms – seconds** | **Largest controllable error.** Windows default can poll as infrequently as every 9 hours, allowing the PC clock to drift by seconds. For a local NTP server, reduce to 64–1024 s (see below) |
 | time.gov browser measurement | 50–100 ms floor | JavaScript timer resolution (~15 ms on Windows) plus internet RTT to time.gov servers. Differences smaller than ~100 ms may be within measurement noise |

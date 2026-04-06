@@ -151,6 +151,13 @@
 // the tracking mode tolerance.
 #define ES100_TRACKING_FALLBACK_MS  604800000UL  // 7 days
 
+// Hours between forced normal-mode syncs during the nighttime window (10 PM – 6 AM).
+// Tracking mode cannot self-correct errors larger than the ES100's ±4 s timing tolerance;
+// a nightly full-frame sync re-anchors absolute time and breaks any error cycle.
+// At 10 PM, if no normal-mode success in this many hours, normal mode is retried every
+// hour until it succeeds, then tracking resumes for the rest of the night.
+#define NIGHTLY_NORMAL_SYNC_HOURS   20UL
+
 // ============================================================================
 // WATCHDOG CONFIGURATION
 // ============================================================================
