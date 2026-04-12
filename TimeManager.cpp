@@ -78,6 +78,12 @@ void TimeManager::setUnixTime(uint32_t unixTime) {
     setTime(year, month, day, hour, minute, second);
 }
 
+void TimeManager::setSubSecondOffset(uint16_t ms) {
+    if (ms >= 1000) ms = ms % 1000;
+    _accumMillis = ms;
+    // _lastTickMillis intentionally not touched — tick() will advance from here.
+}
+
 void TimeManager::setUnixTimePreserveMillis(uint32_t unixTime) {
     // Decompose Unix time into calendar fields without touching _accumMillis/_lastTickMillis.
     // Sub-second phase is preserved from the last full sync.

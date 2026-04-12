@@ -108,6 +108,15 @@ public:
      */
     void setUnixTimePreserveMillis(uint32_t unixTime);
 
+    /**
+     * @brief Set the sub-second accumulator after a setUnixTime() call.
+     * @details Call immediately after setUnixTime() to restore sub-second phase.
+     *          Typical use: pass irqProcessingDelay (ms) so the clock reads
+     *          corrected_second + irq_latency, matching the true time at IRQ fire.
+     * @param ms  Milliseconds within the current second (0–999)
+     */
+    void setSubSecondOffset(uint16_t ms);
+
     
     /**
      * @brief Check if time has been set (synced at least once)

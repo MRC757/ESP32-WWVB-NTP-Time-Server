@@ -2417,6 +2417,10 @@ void handleES100Interrupt() {
 
                     if (sanityOk) {
                         timeManager.setUnixTime(corrected);
+                        // Restore sub-second phase: IRQ fired at the true second boundary;
+                        // irqProcessingDelay ms have elapsed since then.  Setting _accumMillis
+                        // to that value keeps the clock at corrected + delay, matching true time.
+                        timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay & 0x3FF));
                         syncOk = true;
                     }
 
@@ -2441,11 +2445,14 @@ void handleES100Interrupt() {
                     timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
                                        rxTime.hour, rxTime.minute, rxTime.second);
                     // Compensate for measured IRQ→processing delay.
-                    // Rounds to the nearest whole second; sub-second pipeline delay
+                    // Integer seconds (rounds to nearest); sub-second pipeline delay
                     // (~350 ms) is accepted as residual error until calibrated.
                     uint32_t delaySeconds = (irqProcessingDelay + 500UL) / 1000UL;
                     if (delaySeconds > 0)
                         timeManager.setUnixTime(timeManager.getUnixTime() + delaySeconds);
+                    // Set sub-second accumulator to software latency so NTP fractional
+                    // timestamps are consistent between polls (irqProcessingDelay % 1000).
+                    timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay % 1000));
 
                     // DST only comes from normal mode (tracking does not provide it)
                     uint8_t dstBits = (status0 >> 5) & 0x03;

@@ -389,6 +389,26 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 - PC clock vs. NTP server: < 50 ms after a recent poll (limited by WiFi jitter)
 - Visible on time.gov: ± 50–200 ms (limited by browser measurement floor)
 
+#### Real-World Accuracy Example
+
+Measured after 48 hours of continuous operation with no manual resets (April 10–12, 2026):
+
+- **34 successful syncs / 49 attempts** — 69% success rate over 48 h (mix of nighttime tracking and daytime attempts)
+- **Nightly normal-mode anchor** fired at 04:02 UTC each night, followed by hourly tracking syncs through the morning
+- **PC clock offset vs. time.gov: −0.117 s** — with the PC polling the WWVB device's NTP server every 1024 s
+
+The PC's −0.117 s reading (measured by time.gov) includes ~50–100 ms of browser measurement noise, meaning the WWVB device itself was within **~200 ms of UTC** — consistent with the expected DS3231 holdover accuracy.
+
+**`w32tm /query /status` showed:**
+
+| Field | Value | Notes |
+|-------|-------|-------|
+| Root Delay | 37–57 ms | WiFi LAN round-trip to ESP32 |
+| Root Dispersion | 7.9 s → 8.8 s | Flushing stale samples from a prior 7-second clock error; takes ~2.3 h of clean polls to converge |
+| Poll Interval | 1024 s | Windows NTP filter settling |
+
+> **Root Dispersion note:** `w32tm` maintains a filter of 8 historical offset samples. If the clock source was previously off by seconds (e.g., from an uncorrected tracking error), dispersion stays elevated until all 8 bad samples are replaced by good ones — at 1024 s/poll that takes about 2.3 hours. High dispersion during this period is normal and does not mean the clock is currently inaccurate.
+
 #### Recommended Windows NTP client settings for a local server
 
 The default Windows NTP configuration polls as infrequently as every 9 hours, which allows the PC clock to drift by seconds between polls. Run these commands in an elevated command prompt to poll every 64–1024 seconds instead:
