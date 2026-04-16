@@ -26,19 +26,21 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Nightly Normal-Mode Anchor**: Tracking mode cannot self-correct clock errors larger than the ES100's ±4 s timing tolerance — once the clock drifts outside that window, each tracking sync perpetuates rather than corrects the error. To prevent this, the firmware forces a full normal-mode sync at the start of each night (10 PM local) and retries every hour until one succeeds. After a successful full-frame decode, tracking mode resumes for the rest of the night.
 - **Leap Second Detection**: The WWVB signal carries a leap second warning in the week(s) before a scheduled UTC adjustment. The firmware extracts this from the ES100 Status 0 register (bits 3:4) and displays it on the web dashboard.
 - **Antenna Performance Tracking**: Per-antenna success counts are accumulated across reboots (NVS). Both normal-mode and tracking-mode syncs automatically use the antenna with the higher historical success count.
-- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a whole-second correction (minimum 1 s floor for the ES100 pipeline) during normal-mode WWVB syncs. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. NTP client syncs apply half the measured round-trip time; sub-second LAN RTTs result in a 0 s offset, eliminating per-reboot accumulation.
+- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a floor-divided integer seconds plus a sub-second remainder during normal-mode WWVB syncs — `delaySeconds = irqProcessingDelay / 1000`, `subSec = irqProcessingDelay % 1000`. An earlier round-to-nearest formula (`(irqProcessingDelay + 500) / 1000`) caused a +1 s set-point error whenever the main loop was delayed ≥ 500 ms (e.g., during heavy NTP traffic): the rounded-up second was applied by `setUnixTime`, then `setSubSecondOffset` added the full fractional part again, totalling `1000 + frac` ms instead of the correct `frac` ms. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. After setting the integer second, the sub-second accumulator is immediately restored to the IRQ latency value so that NTP fractional timestamps remain stable between sync events. NTP client syncs combine the server's T3 sub-second fraction and half the measured RTT (`totalMs = T3_ms + rttMs/2`) before splitting into integer seconds and milliseconds — this correctly handles the carry when `totalMs ≥ 1000 ms` and prevents a 1-second set-point error that occurred when T3 was late in its second. The NTP server's transmit timestamp (T3) is re-sampled atomically at send time rather than reusing the receive-time integer second, eliminating a ~1 s error that appeared when a second boundary crossed between receive and transmit. `TimeManager::getUnixTime()` accounts for milliseconds elapsed since the last `tick()` call so that NTP timestamps are never stale by up to one full second between 1 Hz display updates. `TimeManager::getUTCTime()` applies the same carry logic so the physical display advances at the same instant the NTP timestamps cross the second boundary — eliminating a ≤1 s lag where the display showed N while NTP reported N+1.
 
 ### Display & Touch Interface
-- **Touch Navigation**: Swipe left/right to move between 4 pages; long-press 10 s to shut down
-- **Page 1 — Clock**: Large local time (12 or 24-hour), date, day of week, sync status, 48-hour WWVB reception chart
-- **Page 2 — UTC Info**: UTC time, time source, seconds since last sync, DS3231 temperature, battery voltage/percentage/charging status
-- **Page 3 — Settings**: Brightness slider (persisted to flash)
-- **Page 4 — WiFi**: Scan and connect to WiFi networks; on-screen QWERTY keyboard for password entry
-- **Sync Status Colors**: Green (< 2 h), Yellow (2–24 h), Red (> 24 h or never synced)
+- **Touch Navigation**: Swipe left/right to move between 5 pages; long-press 10 s to shut down
+- **Page 1 — Clock**: Large local time (12 or 24-hour), date, day of week, last WWVB sync time, 48-hour WWVB reception chart
+- **Page 2 — UTC Info**: UTC time, time source, seconds since last sync, DS3231 temperature, battery voltage/percentage/charging status, last WWVB sync time, 48-hour reception chart
+- **Page 3 — Sync Status**: 48-hour sync count, time source, ES100 mode, signal quality, per-antenna success counts, last WWVB sync time
+- **Page 4 — Settings**: Brightness slider (persisted to flash)
+- **Page 5 — WiFi**: Scan and connect to WiFi networks; on-screen QWERTY keyboard for password entry
+- **Sync Status Colors**: Green (< 12 h), Yellow (12–24 h), Red (> 24 h or never synced)
 - **Reception Chart**: 48-hour bar chart of successful WWVB syncs per hour
 
 ### Networking
-- **Stratum 1 NTP Server**: Serves RFC 5905-compliant NTP responses on UDP port 123; reference ID "WWVB"
+- **Stratum 1 NTP Server**: Serves RFC 5905-compliant NTP responses on UDP port 123; reference ID "WWVB". Stratum transitions automatically: **Stratum 1** after any WWVB sync; **Stratum 2** (upstream IP as reference) if NTP client sync was the last source; **Stratum 16** (LI=3, "LOCL") after 48 hours without any sync. Wi-Fi auto-connect no longer demotes stratum — if WWVB is the current time source, NTP client sync is skipped on connect. Responds only to client (mode 3) and symmetric-active (mode 1) NTP requests per RFC 5905.
+- **NTP Fallback**: When Wi-Fi is connected and WWVB has never synced (or NTP is the configured source), the firmware queries a configurable host (`NTP_FALLBACK_HOST`, default `time.nist.gov`) as a secondary time reference.
 - **Status Web Server**: Browseable dashboard at the device's IP (port 80) showing live time, temperature, battery, sync info, NTP request count, 48-hour WWVB reception chart, manual sync buttons, timezone controls, leap second warning, antenna statistics, and a recent sync log
 - **Captive Portal**: If no WiFi credentials are stored, broadcasts an open AP (`WWVB-Clock-Setup`) with a browser-based setup page showing UTC time, local time, and a sync-source badge
 - **WiFi Credentials**: SSID and password stored in NVS flash (survive reboots)
@@ -179,6 +181,17 @@ Each night at 10 PM, the firmware forces a full normal-mode sync if no successfu
 #define DISPLAY_BRIGHTNESS    200     // 0–255 (also adjustable on Settings page)
 ```
 
+### NTP Fallback Server
+
+```c
+#define NTP_FALLBACK_HOST     "time.nist.gov"
+// Change to a regional pool if time.nist.gov is unreachable, e.g.:
+//   "us.pool.ntp.org"   — IANA NTP Pool (Americas)
+//   "time.cloudflare.com"
+```
+
+The fallback host is queried only when Wi-Fi is connected and the current time source is not WWVB. It has no effect on the Stratum 1 NTP server.
+
 ### WiFi
 
 ```c
@@ -207,8 +220,9 @@ Pins are documented in `config.h` for reference and defined as local constants i
 1. Display initializes (LilyGo AMOLED auto-detects board variant)
 2. DS3231 RTC checked — if present, time is loaded from RTC immediately
 3. Saved WiFi credentials loaded; connection attempt begins if credentials exist
-4. ES100 detected and verified on Wire1 (bus 1, isolated); first WWVB sync attempt starts
-5. Clock displays running time from the best available source
+4. On Wi-Fi connect: NTP sync runs automatically if time source is RTC or None (validates DS3231 set-point before WWVB arrives)
+5. ES100 detected and verified on Wire1 (bus 1, isolated); first WWVB sync attempt starts
+6. Clock displays running time from the best available source
 
 ### Touch Interface
 
@@ -224,8 +238,9 @@ Pins are documented in `config.h` for reference and defined as local constants i
 
 | Page | Content |
 |------|---------|
-| Clock | Local time, date, day of week, sync status, 48-hour reception chart |
-| UTC Info | UTC time, time source, seconds since last sync, RTC temperature, battery |
+| Clock | Local time, date, day of week, last WWVB sync time, 48-hour reception chart |
+| UTC Info | UTC time, time source, seconds since last sync, RTC temperature, battery, last WWVB sync time, 48-hour reception chart |
+| Sync Status | 48h sync count, source, ES100 mode, signal quality, antenna success counts, last WWVB sync time |
 | Settings | Brightness slider |
 | WiFi | Network list, connect button, on-screen keyboard for password |
 
@@ -244,8 +259,25 @@ Once connected to WiFi:
 
 When the clock has a valid time and WiFi is connected, it acts as a **Stratum 1 NTP server**:
 - UDP port 123, RFC 5905 compliant
-- Reference clock identifier: `WWVB`
-- Falls back to Stratum 2 if time source is NTP rather than WWVB
+- Responds only to client (mode 3) and symmetric-active (mode 1) requests
+
+**Stratum transitions:**
+
+| Condition | Stratum | Reference ID |
+|-----------|---------|--------------|
+| After any WWVB sync | 1 | `WWVB` |
+| After NTP client sync (WWVB unavailable) | 2 | Upstream server IPv4 |
+| No sync for 48+ hours | 16 (LI=3) | `LOCL` |
+
+**Wi-Fi connect NTP auto-sync policy:**
+
+| Time source at connect | Behavior |
+|------------------------|----------|
+| RTC or None | Always NTP-sync — corrects any DS3231 set-point error before WWVB has a chance to run |
+| NTP | NTP-sync only if last sync was > 2 hours ago |
+| WWVB | Never NTP-sync — WWVB is authoritative; device stays at Stratum 1 |
+
+This ensures the DS3231's stored time is validated against a network reference on every cold boot while never demoting a freshly WWVB-synced clock to Stratum 2.
 
 Point any NTP client (router, computer, smart home hub) at the device's IP address.
 
@@ -288,11 +320,32 @@ Both buttons are disabled while a sync is in progress or a tracking start is pen
 
 | Color | Indicator | Meaning |
 |-------|-----------|---------|
-| Green | Last sync: Xm ago | Recently synced (< 2 hours) |
-| Yellow | Last sync: Xh ago | Sync aging (2–24 hours) |
-| Red | Last sync: Xh ago | Stale sync (> 24 hours) |
+| Green | Last WWVB: Xm ago | Recently synced (< 12 hours) |
+| Yellow | Last WWVB: Xh Xm ago | Sync aging (12–24 hours) |
+| Red | Last WWVB: Xh Xm ago | Stale sync (> 24 hours) |
 | Yellow | SYNCING… | Reception attempt in progress |
 | Red | NO SYNC YET | Never successfully synced |
+
+### Signal Quality
+
+Displayed on the device's Sync Status page and in the web dashboard status table.
+
+```
+STRONG | TRACKING | Ant: A1
+```
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| Quality | STRONG | ≥ 8 successful syncs in the last 48 h |
+| | GOOD | ≥ 4 syncs in the last 48 h |
+| | FAIR | ≥ 1 sync in the last 48 h |
+| | POOR | 0 syncs in the last 48 h |
+| Mode | TRACKING | A successful normal-mode sync has been achieved; subsequent syncs use the faster tracking mode (~24.5 s). Indicates sustained good signal. |
+| | NORMAL | No normal-mode sync yet this session; using full 1-minute frame decodes |
+| Antenna | A1 / A2 | One antenna has ≥ 2× the success count of the other |
+| | A1+A2 | Both antennas contribute roughly equally |
+
+The quality color matches the sync headline: green (STRONG/GOOD), yellow (FAIR), red (POOR). The ES100 does not expose an RSSI or SNR register; quality is derived entirely from reception statistics.
 
 ### Reception Chart
 
@@ -380,34 +433,41 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 | WWVB signal (NIST) | < 1 µs | Primary UTC reference; error is negligible |
 | ES100 decode + IRQ latency | < 1 ms | Firmware measures and compensates IRQ delay; tracking back-computes from :55 write timestamp |
 | DS3231 holdover (daytime) | < 120 ms | ~2 ppm drift over up to 16 h of daytime (no WWVB reception). Resets each night when a normal-mode anchor sync succeeds |
-| ESP32 WiFi NTP response | 40–80 ms jitter | WiFi adds variable one-way latency. NTP timestamps are captured before transmission; client RTT/2 compensation removes the constant part but not the jitter |
+| ESP32 WiFi NTP response | 5–50 ms jitter | WiFi adds variable one-way latency. T3 is re-sampled atomically at transmit time; `getUnixTime()` accounts for sub-second elapsed time between 1 Hz ticks; client RTT/2 compensation removes the constant part. Jitter is the residual asymmetric delay |
 | **NTP client poll interval** | **0 ms – seconds** | **Largest controllable error.** Windows default can poll as infrequently as every 9 hours, allowing the PC clock to drift by seconds. For a local NTP server, reduce to 64–1024 s (see below) |
 | time.gov browser measurement | 50–100 ms floor | JavaScript timer resolution (~15 ms on Windows) plus internet RTT to time.gov servers. Differences smaller than ~100 ms may be within measurement noise |
 
 **Overall accuracy to UTC when everything is working:**
-- NTP server vs. UTC: < 120 ms (limited by DS3231 daytime holdover)
-- PC clock vs. NTP server: < 50 ms after a recent poll (limited by WiFi jitter)
-- Visible on time.gov: ± 50–200 ms (limited by browser measurement floor)
+- NTP server vs. UTC: < 120 ms (limited by DS3231 daytime holdover between WWVB syncs)
+- PC clock vs. NTP server: < 20 ms after a recent poll (limited by WiFi one-way jitter)
+- Visible on time.gov: ± 50–150 ms (limited by browser measurement floor ~15 ms + internet RTT)
 
 #### Real-World Accuracy Example
 
-Measured after 48 hours of continuous operation with no manual resets (April 10–12, 2026):
+Measured after NTP timestamp fixes applied (April 14, 2026), with NTP as time source (WWVB normal-mode sync still in progress):
 
-- **34 successful syncs / 49 attempts** — 69% success rate over 48 h (mix of nighttime tracking and daytime attempts)
-- **Nightly normal-mode anchor** fired at 04:02 UTC each night, followed by hourly tracking syncs through the morning
-- **PC clock offset vs. time.gov: −0.117 s** — with the PC polling the WWVB device's NTP server every 1024 s
+- **PC clock offset vs. time.gov: +0.004 s** — 4 ms, inside the browser measurement noise floor; effectively perfect
+- **Root Delay: ~95 ms** — WiFi LAN round-trip to ESP32
+- **Root Dispersion: 7.79 s → converging** — w32tm filter flushing samples from the period before fixes; drops below 1 s within ~2 h at 1024 s poll interval
+- **Time source: NTP (Stratum 2)** — WWVB lock overnight will anchor to Stratum 1
 
-The PC's −0.117 s reading (measured by time.gov) includes ~50–100 ms of browser measurement noise, meaning the WWVB device itself was within **~200 ms of UTC** — consistent with the expected DS3231 holdover accuracy.
+Once the nighttime WWVB normal-mode sync succeeds, the DS3231 will be anchored to WWVB UTC and root dispersion will converge to < 100 ms within a single 2.3-hour w32tm filter window.
+
+**Previous result (before NTP timestamp fixes, April 10–12, 2026):**
+
+- **34 successful syncs / 49 attempts** — 69% success rate over 48 h
+- **PC clock offset vs. time.gov: −0.117 s** — with NTP polling every 1024 s
+- Root dispersion 7.9–8.8 s (flushing a prior multi-second set-point error)
 
 **`w32tm /query /status` showed:**
 
 | Field | Value | Notes |
 |-------|-------|-------|
 | Root Delay | 37–57 ms | WiFi LAN round-trip to ESP32 |
-| Root Dispersion | 7.9 s → 8.8 s | Flushing stale samples from a prior 7-second clock error; takes ~2.3 h of clean polls to converge |
+| Root Dispersion | 7.9 s → converges < 1 s | w32tm filter replaces 8 historical samples; at 1024 s/poll takes ~2.3 h |
 | Poll Interval | 1024 s | Windows NTP filter settling |
 
-> **Root Dispersion note:** `w32tm` maintains a filter of 8 historical offset samples. If the clock source was previously off by seconds (e.g., from an uncorrected tracking error), dispersion stays elevated until all 8 bad samples are replaced by good ones — at 1024 s/poll that takes about 2.3 hours. High dispersion during this period is normal and does not mean the clock is currently inaccurate.
+> **Root Dispersion note:** `w32tm` maintains a filter of 8 historical offset samples. If the clock source was previously off by seconds, dispersion stays elevated until all 8 bad samples are replaced — at 1024 s/poll that takes about 2.3 hours. This is a Windows client artifact; it does not mean the WWVB device is currently inaccurate. With the NTP timestamp fixes in place, each new sample is within ~10 ms of true UTC, so dispersion converges cleanly without any manual intervention.
 
 #### Recommended Windows NTP client settings for a local server
 

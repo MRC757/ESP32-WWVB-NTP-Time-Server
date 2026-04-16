@@ -82,7 +82,7 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastSyncAttempt = 0;
 uint8_t daytimeFailures = 0;          // Consecutive daytime sync failures
 bool daytimeSkipActive = false;       // True when backed off until nighttime
-int8_t utcOffset = -5;  // Eastern Time
+int8_t utcOffset = DEFAULT_UTC_OFFSET;
 bool dstActive = false;
 unsigned long lastDSTCheck = 0;  // millis() of last auto-DST computation
 
@@ -131,7 +131,7 @@ uint16_t CHART_HEIGHT;
 // ============================================================================
 // Page Navigation & Touch State
 // ============================================================================
-enum DisplayPage { PAGE_CLOCK, PAGE_UTC, PAGE_SETTINGS, PAGE_WIFI };
+enum DisplayPage { PAGE_CLOCK, PAGE_UTC, PAGE_SYNC, PAGE_SETTINGS, PAGE_WIFI };
 DisplayPage currentPage = PAGE_CLOCK;
 uint8_t currentBrightness = DISPLAY_BRIGHTNESS;
 
@@ -322,7 +322,7 @@ void initDisplay() {
     // Load saved settings
     preferences.begin("wwvb", true);
     currentBrightness = preferences.getUChar("brightness", DISPLAY_BRIGHTNESS);
-    utcOffset = preferences.getChar("utcOffset", -5);  // Default: Eastern Time
+    utcOffset = preferences.getChar("utcOffset", DEFAULT_UTC_OFFSET);
     preferences.end();
     amoled.setBrightness(currentBrightness);
     Serial.printf("[DISPLAY] Brightness set to %d\n", currentBrightness);
@@ -507,8 +507,8 @@ void drawSyncStatus() {
     }
     
     drawCenteredText(statusStr, STATUS_Y, statusColor, 2);
-    
-    // Draw time source and reception stats
+
+    // Time source and 48h reception stats
     const char* srcName = "---";
     switch (lastTimeSource) {
         case TIME_SRC_WWVB: srcName = "WWVB"; break;
@@ -519,7 +519,7 @@ void drawSyncStatus() {
     char statsStr[64];
     snprintf(statsStr, sizeof(statsStr), "Src: %s | 48h: %d syncs | Total: %d",
              srcName, total48h, totalSuccess);
-    drawCenteredText(statsStr, STATUS_Y + 35, COLOR_TEXT_DIM, 1);
+    drawCenteredText(statsStr, STATUS_Y + 22, COLOR_TEXT_DIM, 1);
 
     // Draw DST indicator if active
     if (dstActive) {
@@ -627,6 +627,173 @@ void drawTemperature() {
     sprite.setTextDatum(TR_DATUM);  // Top-right alignment
 
     sprite.drawString(tempStr, DISPLAY_WIDTH - 2, 2);
+}
+
+// ============================================================================
+// Last WWVB Sync Time — one line drawn on clock pages at STATUS_Y
+// ============================================================================
+void drawLastSyncTime() {
+    unsigned long lastSync = receptionHistory.getLastSuccessTime();
+    if (lastSync == 0) return;
+
+    unsigned long elapsed = (millis() - lastSync) / 1000;
+    int hours = elapsed / 3600;
+    int mins  = (elapsed % 3600) / 60;
+    char str[40];
+    if (hours > 0) {
+        snprintf(str, sizeof(str), "Last WWVB: %dh %dm ago", hours, mins);
+    } else {
+        snprintf(str, sizeof(str), "Last WWVB: %dm ago", mins);
+    }
+    uint16_t color = (elapsed < 43200) ? COLOR_SYNC_OK :      // < 12 h → green
+                     (elapsed < 86400) ? COLOR_SYNC_PENDING : // < 24 h → yellow
+                                         COLOR_SYNC_FAIL;     // ≥ 24 h → red
+
+    sprite.setTextSize(1);
+    sprite.setTextColor(color, COLOR_BACKGROUND);
+    sprite.setTextDatum(TC_DATUM);
+    sprite.drawString(str, DISPLAY_WIDTH / 2, STATUS_Y);
+}
+
+// ============================================================================
+// Sync Status Page
+// ============================================================================
+void drawSyncPage() {
+    sprite.fillSprite(COLOR_BACKGROUND);
+
+    int w = DISPLAY_WIDTH;
+
+    // ── Title ──────────────────────────────────────────────
+    sprite.setTextSize(1);
+    sprite.setTextColor(COLOR_TIME, COLOR_BACKGROUND);
+    sprite.setTextDatum(TC_DATUM);
+    sprite.drawString("SYNC STATUS", w / 2, 8);
+    sprite.drawFastHLine(20, 22, w - 40, COLOR_CHART_GRID);
+
+    // ── 48-hour sync count ─────────────────────────────────
+    int total48h = receptionHistory.getRecentSuccessCount();
+    const char* sigQuality;
+    uint16_t    sigColor;
+    if      (total48h >= 8) { sigQuality = "STRONG"; sigColor = COLOR_SYNC_OK;      }
+    else if (total48h >= 4) { sigQuality = "GOOD";   sigColor = TFT_GREEN;           }
+    else if (total48h >= 1) { sigQuality = "FAIR";   sigColor = COLOR_SYNC_PENDING;  }
+    else                    { sigQuality = "POOR";   sigColor = COLOR_SYNC_FAIL;     }
+
+    // ── Two-column rows: label left, value right ────────────
+    const int labelX = 22;
+    const int valueX = w - 22;
+    int       rowY   = 30;
+    const int rowH   = 24;
+
+    sprite.setTextSize(1);
+
+    // 48-hour sync count
+    char countStr[8];
+    snprintf(countStr, sizeof(countStr), "%d", total48h);
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("48H SYNCS", labelX, rowY);
+    sprite.setTextColor(sigColor, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(countStr, valueX, rowY);
+    rowY += rowH;
+
+    // Source
+    const char* srcName;
+    uint16_t    srcColor;
+    switch (lastTimeSource) {
+        case TIME_SRC_WWVB: srcName = "WWVB"; srcColor = COLOR_SYNC_OK;      break;
+        case TIME_SRC_NTP:  srcName = "NTP";  srcColor = COLOR_TIME;          break;
+        case TIME_SRC_RTC:  srcName = "RTC";  srcColor = COLOR_SYNC_PENDING;  break;
+        default:            srcName = "---";  srcColor = COLOR_TEXT_DIM;      break;
+    }
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("SOURCE", labelX, rowY);
+    sprite.setTextColor(srcColor, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(srcName, valueX, rowY);
+    rowY += rowH;
+
+    // Mode
+    const char* modeStr;
+    uint16_t    modeColor;
+    if (!es100Available) {
+        modeStr = "ES100 FAULT";  modeColor = COLOR_SYNC_FAIL;
+    } else if (es100Receiving) {
+        modeStr = es100UsingTracking ? "TRACKING..." : "SYNCING...";
+        modeColor = COLOR_SYNC_PENDING;
+    } else if (es100TrackingReady) {
+        modeStr = "TRACKING";   modeColor = COLOR_SYNC_OK;
+    } else {
+        modeStr = "NORMAL";     modeColor = COLOR_TEXT_DIM;
+    }
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("MODE", labelX, rowY);
+    sprite.setTextColor(modeColor, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(modeStr, valueX, rowY);
+    rowY += rowH;
+
+    sprite.drawFastHLine(20, rowY, w - 40, COLOR_CHART_GRID);
+    rowY += 8;
+
+    // Signal quality
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("SIGNAL", labelX, rowY);
+    sprite.setTextColor(sigColor, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(sigQuality, valueX, rowY);
+    rowY += rowH;
+
+    sprite.drawFastHLine(20, rowY, w - 40, COLOR_CHART_GRID);
+    rowY += 8;
+
+    // Antenna successes
+    char antStr[8];
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("ANTENNA 1", labelX, rowY);
+    snprintf(antStr, sizeof(antStr), "%d", ant1Successes);
+    sprite.setTextColor(COLOR_DATE, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(antStr, valueX, rowY);
+    rowY += rowH;
+
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TL_DATUM);
+    sprite.drawString("ANTENNA 2", labelX, rowY);
+    snprintf(antStr, sizeof(antStr), "%d", ant2Successes);
+    sprite.setTextColor(COLOR_DATE, COLOR_BACKGROUND);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.drawString(antStr, valueX, rowY);
+    rowY += rowH;
+
+    sprite.drawFastHLine(20, rowY, w - 40, COLOR_CHART_GRID);
+    rowY += 8;
+
+    // Last WWVB sync time
+    unsigned long lastSync = receptionHistory.getLastSuccessTime();
+    sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BACKGROUND);
+    sprite.setTextDatum(TC_DATUM);
+    if (lastSync > 0) {
+        unsigned long elapsed = (millis() - lastSync) / 1000;
+        int hours = elapsed / 3600;
+        int mins  = (elapsed % 3600) / 60;
+        char lastSyncStr[40];
+        if (hours > 0) {
+            snprintf(lastSyncStr, sizeof(lastSyncStr), "Last WWVB: %dh %dm ago", hours, mins);
+        } else {
+            snprintf(lastSyncStr, sizeof(lastSyncStr), "Last WWVB: %dm ago", mins);
+        }
+        sprite.drawString(lastSyncStr, w / 2, rowY);
+    } else {
+        sprite.setTextColor(COLOR_SYNC_FAIL, COLOR_BACKGROUND);
+        sprite.drawString("No WWVB sync yet", w / 2, rowY);
+    }
+
 }
 
 // ============================================================================
@@ -937,9 +1104,19 @@ void wifiCheckConnection() {
             statusServer.begin();
         }
 
-        // Auto-sync time from NTP if WWVB hasn't synced recently (>2 hours)
+        // NTP auto-sync policy on Wi-Fi connect:
+        //   RTC / None  — always sync: corrects any DS3231 set-point error at boot
+        //   NTP         — sync only if last sync was >2 h ago (refresh stale fix)
+        //   WWVB        — never auto-sync: WWVB is authoritative, preserves Stratum 1
         unsigned long sinceLast = (lastTimeSyncMillis > 0) ? millis() - lastTimeSyncMillis : UINT32_MAX;
-        if (lastTimeSource != TIME_SRC_WWVB || sinceLast > 7200000UL) {
+        bool shouldNtpSync = false;
+        if (lastTimeSource == TIME_SRC_NONE || lastTimeSource == TIME_SRC_RTC) {
+            shouldNtpSync = true;                          // always correct DS3231 errors
+        } else if (lastTimeSource == TIME_SRC_NTP && sinceLast > 7200000UL) {
+            shouldNtpSync = true;                          // refresh stale NTP fix
+        }
+        // TIME_SRC_WWVB: never — preserves Stratum 1
+        if (shouldNtpSync) {
             Serial.println("[WIFI] Auto-syncing time from NTP...");
             ntpClientSync();
         }
@@ -1750,14 +1927,16 @@ void updateDisplay() {
     // Draw current page
     if (currentPage == PAGE_CLOCK) {
         drawClockFace(false);
-        drawSyncStatus();
+        drawLastSyncTime();
         drawReceptionChart();
         drawTemperature();
     } else if (currentPage == PAGE_UTC) {
         drawClockFace(true);
-        drawSyncStatus();
+        drawLastSyncTime();
         drawReceptionChart();
         drawTemperature();
+    } else if (currentPage == PAGE_SYNC) {
+        drawSyncPage();
     } else if (currentPage == PAGE_SETTINGS) {
         drawSettingsPage();
     } else if (currentPage == PAGE_WIFI) {
@@ -1998,15 +2177,15 @@ bool ntpClientSync() {
         return false;
     }
 
-    Serial.println("[NTP-CLIENT] Querying time.nist.gov...");
+    Serial.printf("[NTP-CLIENT] Querying %s...\n", NTP_FALLBACK_HOST);
 
     // Resolve DNS first so we can store the upstream IP for Stratum 2 refId
     IPAddress ntpServerIP;
-    if (WiFi.hostByName("time.nist.gov", ntpServerIP) != 1) {
-        Serial.println("[NTP-CLIENT] DNS resolution failed for time.nist.gov");
+    if (WiFi.hostByName(NTP_FALLBACK_HOST, ntpServerIP) != 1) {
+        Serial.printf("[NTP-CLIENT] DNS resolution failed for %s\n", NTP_FALLBACK_HOST);
         return false;
     }
-    Serial.printf("[NTP-CLIENT] Resolved time.nist.gov → %s\n", ntpServerIP.toString().c_str());
+    Serial.printf("[NTP-CLIENT] Resolved %s → %s\n", NTP_FALLBACK_HOST, ntpServerIP.toString().c_str());
 
     WiFiUDP udp;
     if (!udp.begin(0)) {  // Ephemeral local port
@@ -2060,14 +2239,28 @@ bool ntpClientSync() {
     // Convert NTP timestamp (since 1900) to Unix timestamp (since 1970)
     uint32_t unixTime = t3_ntp - NTP_EPOCH_OFFSET;
 
+    // Extract T3 sub-second fraction (bytes 44–47): NTP 32-bit fraction → milliseconds.
+    uint32_t t3_frac = ((uint32_t)packet[44] << 24) | ((uint32_t)packet[45] << 16) |
+                       ((uint32_t)packet[46] << 8)  |  (uint32_t)packet[47];
+    uint16_t t3_ms = (uint16_t)(t3_frac / 4294967UL);
+
     // RTT compensation: apply half the measured round-trip as a one-way delay offset.
-    // No minimum 1s floor — NTP delivers accurate time without WWVB pipeline delay.
-    // For sub-second LAN RTTs offsetSec = 0 (correct); only WAN RTTs > 2s get +1s.
-    unsigned long rttMs = t4 - t1;
-    uint32_t offsetSec  = (uint32_t)((rttMs / 2 + 500) / 1000);
-    timeManager.setUnixTime(unixTime + offsetSec);
-    Serial.printf("[NTP-CLIENT] RTT=%lums, applied offset=%lus\n",
-                  (unsigned long)rttMs, (unsigned long)offsetSec);
+    // Combine T3 sub-second (t3_ms) with half-RTT before splitting into integer seconds
+    // and milliseconds.  This correctly handles the carry when t3_ms + rttMs/2 >= 1000 —
+    // the previous approach computed offsetSec from rttMs/2 alone and missed the carry,
+    // which set the clock exactly 1 second behind whenever T3 was late in the second.
+    unsigned long rttMs     = t4 - t1;
+    uint32_t totalMs        = (uint32_t)t3_ms + (uint32_t)(rttMs / 2);
+    uint16_t subSecOffsetMs = (uint16_t)(totalMs % 1000);
+
+    timeManager.setUnixTime(unixTime + totalMs / 1000);
+    // Restore sub-second phase from T3 fraction + half-RTT so NTP fractional
+    // timestamps are stable between polls (same fix as WWVB tracking path).
+    timeManager.setSubSecondOffset(subSecOffsetMs);
+
+    Serial.printf("[NTP-CLIENT] RTT=%lums, T3_ms=%u, totalMs=%lu (+%lus + %ums sub-sec)\n",
+                  (unsigned long)rttMs, t3_ms, (unsigned long)totalMs,
+                  (unsigned long)(totalMs / 1000), subSecOffsetMs);
     saveTimeToDS3231();
 
     // Track time source — NTP is Stratum 2
@@ -2077,6 +2270,7 @@ bool ntpClientSync() {
     snapshotSyncTime();
     ntpServer.setStratum(2, ntpServerIP);
     ntpServer.setLastSyncTime(timeManager.getUnixTime());
+    ntpServer.setLeapIndicator(0);  // Clear any alarm state from prior stratum-16 period
     captivePortal.setTimeSource((uint8_t)lastTimeSource);
 
     // Recompute DST from calendar after NTP time update
@@ -2420,7 +2614,7 @@ void handleES100Interrupt() {
                         // Restore sub-second phase: IRQ fired at the true second boundary;
                         // irqProcessingDelay ms have elapsed since then.  Setting _accumMillis
                         // to that value keeps the clock at corrected + delay, matching true time.
-                        timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay & 0x3FF));
+                        timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay % 1000));
                         syncOk = true;
                     }
 
@@ -2445,13 +2639,16 @@ void handleES100Interrupt() {
                     timeManager.setTime(rxTime.year, rxTime.month, rxTime.day,
                                        rxTime.hour, rxTime.minute, rxTime.second);
                     // Compensate for measured IRQ→processing delay.
-                    // Integer seconds (rounds to nearest); sub-second pipeline delay
-                    // (~350 ms) is accepted as residual error until calibrated.
-                    uint32_t delaySeconds = (irqProcessingDelay + 500UL) / 1000UL;
+                    // Use floor division so delaySeconds and setSubSecondOffset partition
+                    // irqProcessingDelay without overlap.  The previous round-to-nearest
+                    // formula caused a +1 s set-point error whenever irqProcessingDelay
+                    // was ≥ 500 ms (e.g. main loop busy with NTP traffic): delaySeconds
+                    // rounded up by 1, then setSubSecondOffset added the full fractional
+                    // part again, applying 1000 + frac ms instead of just frac ms.
+                    uint32_t delaySeconds = irqProcessingDelay / 1000UL;
                     if (delaySeconds > 0)
                         timeManager.setUnixTime(timeManager.getUnixTime() + delaySeconds);
-                    // Set sub-second accumulator to software latency so NTP fractional
-                    // timestamps are consistent between polls (irqProcessingDelay % 1000).
+                    // Sub-second accumulator: remainder after removing whole seconds.
                     timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay % 1000));
 
                     // DST only comes from normal mode (tracking does not provide it)
@@ -2786,11 +2983,13 @@ void loop() {
         timeManager.tick();
         syncFromDS3231();  // Read DS3231 as authoritative time source
 
-        // Degrade NTP stratum to 16 if too long without any sync (RFC 5905 §7.3)
+        // Degrade NTP stratum to 16 if too long without any sync (RFC 5905 §7.3).
+        // LI=3 (alarm) is required by RFC 5905 when the server is unsynchronized.
         if (timeManager.isTimeSet() &&
             timeManager.getSecondsSinceSync() > NTP_UNSYNC_STRATUM_THRESHOLD_S) {
             if (ntpServer.isRunning()) {
                 ntpServer.setStratum(16, "LOCL");
+                ntpServer.setLeapIndicator(3);  // RFC 5905: LI=3 when unsynchronized
             }
         }
 
@@ -2812,6 +3011,7 @@ void loop() {
         statusData.es100Receiving        = es100Receiving;
         statusData.es100Tracking         = es100UsingTracking;
         statusData.es100PendingTracking  = pendingTrackingStart;
+        statusData.es100TrackingReady    = es100TrackingReady;
         statusData.leapSecondWarning     = wwvbLeapSecondWarning;
         statusData.ant1Successes         = ant1Successes;
         statusData.ant2Successes         = ant2Successes;

@@ -69,6 +69,14 @@ void NTPServer::handleClient() {
     uint8_t clientVN = (request[0] >> 3) & 0x07;
     uint8_t clientMode = request[0] & 0x07;
 
+    // RFC 5905: only respond to client (mode 3) or symmetric-active (mode 1) requests.
+    // Ignore server probes (4), broadcast (5), control (6), and private (7) messages.
+    if (clientMode != 3 && clientMode != 1) {
+        Serial.printf("[NTP] Ignoring non-client mode %d from %s:%d\n",
+                     clientMode, remoteIP.toString().c_str(), remotePort);
+        return;
+    }
+
     // Don't respond if time hasn't been set — would serve year-2000 timestamps
     if (!_timeManager->isTimeSet()) {
         Serial.printf("[NTP] Ignoring request from %s:%d — time not set\n",
@@ -182,11 +190,15 @@ void NTPServer::buildResponse(const uint8_t* request, uint8_t* response) {
     writeUint32(&response[32], ntpNow);      // Seconds
     writeUint32(&response[36], ntpFraction);  // Fraction (~1ms resolution)
 
-    // Bytes 40-47: Transmit Timestamp (when we send the response)
-    // Re-sample milliseconds for slightly more accurate transmit time
-    uint32_t txFraction = (uint32_t)_timeManager->getMilliseconds() * 4294967UL;
-    writeUint32(&response[40], ntpNow);      // Seconds
-    writeUint32(&response[44], txFraction);   // Fraction (~1ms resolution)
+    // Bytes 40-47: Transmit Timestamp — re-sample atomically at send time.
+    // Must NOT reuse ntpNow (receive-time integer second): if a second boundary
+    // passes between T2 and T3, the fraction wraps to a small value while the
+    // integer second stays stale, producing a T3 that is ~1 s behind reality.
+    uint32_t txUnix;
+    uint16_t txMs;
+    _timeManager->getTimeSnapshot(txUnix, txMs);
+    writeUint32(&response[40], unixToNTP(txUnix));
+    writeUint32(&response[44], (uint32_t)txMs * 4294967UL);
 }
 
 uint32_t NTPServer::unixToNTP(uint32_t unixTime) {

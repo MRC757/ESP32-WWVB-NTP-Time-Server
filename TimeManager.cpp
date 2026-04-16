@@ -119,12 +119,41 @@ void TimeManager::setUnixTimePreserveMillis(uint32_t unixTime) {
 // ============================================================================
 ClockTime TimeManager::getUTCTime() {
     ClockTime dt;
-    dt.year = _year;
-    dt.month = _month;
-    dt.day = _day;
-    dt.hour = _hour;
+    dt.year   = _year;
+    dt.month  = _month;
+    dt.day    = _day;
+    dt.hour   = _hour;
     dt.minute = _minute;
     dt.second = _second;
+
+    // Mirror the carry logic from getUnixTime(): if accumulated millis have
+    // overflowed a second boundary but tick() hasn't fired yet, advance the
+    // display by one second so it matches getUnixTime().  Without this the
+    // display lags behind the NTP timestamps by up to ~1 second.
+    unsigned long elapsed = millis() - _lastTickMillis;
+    if (_timeSet && (_accumMillis + (uint32_t)elapsed) >= 1000UL) {
+        dt.second++;
+        if (dt.second >= 60) {
+            dt.second = 0;
+            dt.minute++;
+            if (dt.minute >= 60) {
+                dt.minute = 0;
+                dt.hour++;
+                if (dt.hour >= 24) {
+                    dt.hour = 0;
+                    dt.day++;
+                    if (dt.day > daysInMonth(dt.year, dt.month)) {
+                        dt.day = 1;
+                        dt.month++;
+                        if (dt.month > 12) {
+                            dt.month = 1;
+                            dt.year++;
+                        }
+                    }
+                }
+            }
+        }
+    }
     return dt;
 }
 
@@ -182,23 +211,31 @@ ClockTime TimeManager::getLocalTime(int8_t utcOffset, bool dst) {
 
 uint32_t TimeManager::getUnixTime() {
     uint32_t unixTime = 0;
-    
+
     // Add years since 1970
     for (uint16_t y = 1970; y < _year; y++) {
         unixTime += isLeapYear(y) ? 366UL * 86400UL : 365UL * 86400UL;
     }
-    
+
     // Add months of current year
     for (uint8_t m = 1; m < _month; m++) {
         unixTime += (uint32_t)daysInMonth(_year, m) * 86400UL;
     }
-    
+
     // Add days, hours, minutes, seconds
     unixTime += (uint32_t)(_day - 1) * 86400UL;
     unixTime += (uint32_t)_hour * 3600UL;
     unixTime += (uint32_t)_minute * 60UL;
     unixTime += _second;
-    
+
+    // Account for elapsed millis since last tick() that have not yet been
+    // incorporated into _second.  Without this, getUnixTime() returns a stale
+    // second for up to (sub-second phase) ms before each tick() fires — up to
+    // 999 ms behind reality.  getMilliseconds() already wraps at 1000 ms, so
+    // both functions must use the same elapsed basis to stay coherent.
+    unsigned long elapsed = millis() - _lastTickMillis;
+    unixTime += (_accumMillis + (uint32_t)elapsed) / 1000UL;
+
     return unixTime;
 }
 

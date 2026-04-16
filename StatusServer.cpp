@@ -184,6 +184,30 @@ void StatusServer::handleApiStatus() {
             (int)_statusData->ant2Successes);
     }
 
+    // Signal quality (ES100 has no RSSI/SNR register; derived from reception statistics)
+    if (pos < (int)sizeof(buf) - 60) {
+        int recent48h = _receptionHistory ? _receptionHistory->getRecentSuccessCount() : 0;
+        const char* sigq;
+        if      (recent48h >= 8) sigq = "STRONG";
+        else if (recent48h >= 4) sigq = "GOOD";
+        else if (recent48h >= 1) sigq = "FAIR";
+        else                     sigq = "POOR";
+
+        const char* sigm = _statusData->es100TrackingReady ? "TRACKING" : "NORMAL";
+
+        char siga[8];
+        uint16_t a1 = _statusData->ant1Successes;
+        uint16_t a2 = _statusData->ant2Successes;
+        if      (a1 == 0 && a2 == 0)                    snprintf(siga, sizeof(siga), "---");
+        else if ((uint32_t)a1 >= (uint32_t)a2 * 2)      snprintf(siga, sizeof(siga), "A1");
+        else if ((uint32_t)a2 >= (uint32_t)a1 * 2)      snprintf(siga, sizeof(siga), "A2");
+        else                                             snprintf(siga, sizeof(siga), "A1+A2");
+
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            ",\"sigq\":\"%s\",\"sigm\":\"%s\",\"siga\":\"%s\"",
+            sigq, sigm, siga);
+    }
+
     // Close the JSON object
     if (pos < (int)sizeof(buf) - 1) {
         buf[pos++] = '}';
@@ -391,6 +415,7 @@ String StatusServer::buildPage() {
             "</span></div>";
     html += "<div class='row'><span>Leap Second</span><span id='lsw'>--</span></div>";
     html += "<div class='row'><span>Antenna Successes</span><span id='ant'>--</span></div>";
+    html += "<div class='row'><span>Signal Quality</span><span id='sigq'>--</span></div>";
     html += "</div>";
 
     // Manual sync buttons
@@ -499,6 +524,12 @@ String StatusServer::buildPage() {
     html += "document.getElementById('lsw').textContent=_lswLabels[d.lsw||0]||'None';";
     // Antenna successes
     html += "document.getElementById('ant').textContent='Ant1: '+d.ant1+' / Ant2: '+d.ant2;";
+    // Signal quality
+    html += "if(d.sigq){";
+    html += "var sqEl=document.getElementById('sigq');";
+    html += "sqEl.textContent=d.sigq+' | '+d.sigm+' | Ant: '+d.siga;";
+    html += "var sqColor={'STRONG':'#00ff88','GOOD':'#88cc88','FAIR':'#ffcc00','POOR':'#cc4444'};";
+    html += "sqEl.style.color=sqColor[d.sigq]||'#e0e0e0';}";
     html += "}).catch(()=>{});}";
     // Fetch sync log and rebuild table
     html += "function fetchLog(){fetch('/api/log').then(r=>r.json()).then(rows=>{";

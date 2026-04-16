@@ -35,6 +35,7 @@ struct StatusData {
     bool     es100Receiving;        // ES100 currently receiving WWVB signal
     bool     es100Tracking;         // Current receive attempt is tracking mode (vs normal)
     bool     es100PendingTracking;  // Waiting to write Control 0 at second :55
+    bool     es100TrackingReady;    // At least one normal-mode sync done; tracking mode available
     char     lastSyncTimeStr[20];   // "YYYY-MM-DD HH:MM:SS" UTC of last sync, "" if never
     uint8_t  leapSecondWarning;     // 0=none, 1=positive(+1s), 2=negative(-1s)
     uint16_t ant1Successes;         // Lifetime Antenna 1 sync successes

@@ -199,6 +199,10 @@
 #define NTP_PORT              123
 #define NTP_EPOCH_OFFSET      2208988800UL  // Seconds between 1900-01-01 and 1970-01-01
 
+// NTP fallback host — queried when Wi-Fi is connected and no WWVB sync is available.
+// Change to a regional pool (e.g., "us.pool.ntp.org") if time.nist.gov is unreachable.
+#define NTP_FALLBACK_HOST     "time.nist.gov"
+
 // ============================================================================
 // ON-SCREEN KEYBOARD GEOMETRY
 // ============================================================================
