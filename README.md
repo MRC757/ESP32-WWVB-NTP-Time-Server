@@ -60,7 +60,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 | LilyGo T-Display-S3 AMOLED | ESP32-S3 with 1.91" AMOLED display (536×240) |
 | ES100 WWVB Receiver | Everset Technologies ES100-MOD or compatible |
 | 60 kHz Ferrite Bar Antenna | WWVB receive antenna (1 or 2 supported) |
-| DS3231 RTC Module | I2C real-time clock (optional but recommended) |
+| DS3231 RTC Module | I2C real-time clock (optional but recommended) — **use a genuine Adafruit or SparkFun module; cheap clones drift 30–70 ppm** |
 
 The ES100 chip requires an external 16 MHz crystal for its internal oscillator. The official **ES100-MOD** module includes this crystal onboard. Third-party breakout boards may omit it — check your specific module before assuming the crystal is present.
 
@@ -386,7 +386,21 @@ The bar chart shows successful WWVB receptions over the past 48 hours:
 
 ### Clock drifting between syncs
 
-Normal behavior. The ESP32-S3 crystal has ~20 ppm accuracy. The DS3231 RTC has ~2 ppm (with temperature compensation), so the RTC provides much better holdover between syncs.
+The ESP32-S3 crystal has ~20 ppm accuracy. A **genuine DS3231** (Maxim/Analog Devices) has ~2 ppm with temperature compensation, providing much better holdover between WWVB syncs.
+
+**Clone DS3231 modules are a known problem.** Cheap breakout boards from Amazon/AliExpress (HiLetgo, etc.) frequently pair the DS3231 die with an off-spec or aged crystal, resulting in 30–70 ppm drift — 15–35× outside spec. Symptoms:
+
+- Clock drifts 1–2 seconds over 6 hours between WWVB syncs
+- Tracking sync must reanchor every hour to maintain accuracy
+- Drift is too large for the ES100's ±4 s tracking tolerance to absorb after a missed overnight normal-mode sync
+
+**How to identify a suspect module:** Check the date code on the chip. A code like `1438` means week 38 of 2014 — a 10+ year old chip. Even genuine Maxim silicon drifts more as the crystal ages. Modules with no legible Maxim/ADI logo are almost certainly clones.
+
+**Recommended modules:**
+- Adafruit DS3231 Precision RTC Breakout (#3013) — genuine DS3231SN with a Seiko Epson crystal
+- SparkFun DeadOn RTC Breakout (BOB-12708) — also uses genuine parts
+
+The nightly normal-mode WWVB anchor (10 PM) limits maximum DS3231 holdover to ~16 hours. At spec (2 ppm) that is < 120 ms of drift. At 65 ppm (bad clone) that is ~3.7 s — near the ES100's ±4 s tracking tolerance limit.
 
 ### WiFi won't connect
 
