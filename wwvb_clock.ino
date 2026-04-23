@@ -2246,6 +2246,11 @@ void processDS3231SquareWave() {
         Serial.printf("Saved time to DS3231 on 1Hz boundary: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                      utc.year, utc.month, utc.day,
                      utc.hour, utc.minute, utc.second);
+        // The rtc.adjust() write resets the DS3231 oscillator phase — this SQW edge
+        // belongs to the old oscillator boundary, not to anchorUnix.  Skip the phase
+        // anchor here; the next natural SQW edge (≤1 s away) will re-lock using
+        // rtc.now() from the freshly-written DS3231, giving the correct anchor.
+        return;
     } else {
         if (!rtcAvailable) {
             return;
