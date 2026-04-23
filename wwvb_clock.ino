@@ -108,6 +108,10 @@ const unsigned long ES100_RETRY_INTERVALS[] = {5000, 10000, 30000, 60000, 300000
 bool rtcAvailable = false;
 float rtcTemperature = 0.0;  // Temperature from DS3231 (Celsius)
 unsigned long lastTempRead = 0;  // millis() of last temperature read
+volatile bool rtcSqwInterruptFlag = false;
+volatile uint32_t rtcSqwEdgeMicros = 0;
+unsigned long lastRtcSqwSeenMillis = 0;
+unsigned long lastRtcSqwStatusLogMillis = 0;
 
 // Low battery tracking
 bool lowBatteryAlerted = false;         // True once 10% alert has been triggered
@@ -193,6 +197,7 @@ void startWWVBSync(bool forceNormal);
 void startWWVBSyncTracking();
 void recordSyncFailure(bool wasTracking);
 void addSyncLogEntry(bool success, bool tracking, uint8_t antenna);
+void processDS3231SquareWave();
 
 // ============================================================================
 // On-Screen Keyboard State
@@ -232,6 +237,11 @@ static const char KB_ROW3_SYM[]   = ")-_+=[]";
 void IRAM_ATTR es100ISR() {
     es100IRQMillis = millis();    // Capture time at IRQ edge (IRAM-safe on ESP32)
     es100InterruptFlag = true;    // Set flag after timestamp for ordering guarantee
+}
+
+void IRAM_ATTR rtcSqwISR() {
+    rtcSqwEdgeMicros = micros();
+    rtcSqwInterruptFlag = true;
 }
 
 // ============================================================================
@@ -2070,6 +2080,17 @@ bool initializeDS3231() {
         // Don't set a default time - wait for ES100 sync
     }
 
+    rtc.disable32K();
+    rtc.writeSqwPinMode(DS3231_SquareWave1Hz);
+#if PIN_DS3231_SQW >= 0
+    pinMode(PIN_DS3231_SQW, INPUT_PULLUP);
+    rtcSqwInterruptFlag = false;
+    attachInterrupt(digitalPinToInterrupt(PIN_DS3231_SQW), rtcSqwISR, FALLING);
+    Serial.printf("DS3231 1Hz SQW enabled on GPIO%d\n", PIN_DS3231_SQW);
+#else
+    Serial.println("DS3231 1Hz SQW support compiled in but disabled (PIN_DS3231_SQW = -1)");
+#endif
+
     rtcAvailable = true;
     return true;
 }
@@ -2157,6 +2178,52 @@ void syncFromDS3231() {
         // reset the sub-second accumulator that feeds NTP fractional timestamps.
         timeManager.setUnixTimePreserveMillis(rtcUnix);
     }
+}
+
+void processDS3231SquareWave() {
+#if PIN_DS3231_SQW < 0
+    return;
+#else
+    if (!rtcSqwInterruptFlag) {
+        if (timeManager.hasRTCPhaseAnchor() &&
+            lastRtcSqwSeenMillis > 0 &&
+            (millis() - lastRtcSqwSeenMillis) > 2500UL) {
+            timeManager.clearRTCPhaseAnchor();
+            Serial.println("[RTC-SQW] lost lock");
+            lastRtcSqwStatusLogMillis = 0;
+        }
+        return;
+    }
+
+    noInterrupts();
+    uint32_t edgeMicros = rtcSqwEdgeMicros;
+    rtcSqwInterruptFlag = false;
+    interrupts();
+
+    if (!rtcAvailable) {
+        return;
+    }
+
+    DateTime rtcTime = rtc.now();
+    if (rtcTime.year() < 2025 || rtcTime.year() > 2100) {
+        return;
+    }
+
+    bool wasLocked = timeManager.hasRTCPhaseAnchor();
+    timeManager.setRTCPhaseAnchor(rtcTime.unixtime(), edgeMicros);
+    lastRtcSqwSeenMillis = millis();
+    if (!wasLocked) {
+        Serial.printf("[RTC-SQW] lock acquired: unix=%lu micros=%lu\n",
+                      (unsigned long)rtcTime.unixtime(),
+                      (unsigned long)edgeMicros);
+        lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
+    } else if ((lastRtcSqwSeenMillis - lastRtcSqwStatusLogMillis) >= 60000UL) {
+        Serial.printf("[RTC-SQW] edge ok: unix=%lu micros=%lu\n",
+                      (unsigned long)rtcTime.unixtime(),
+                      (unsigned long)edgeMicros);
+        lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
+    }
+#endif
 }
 
 void readDS3231Temperature() {
@@ -2970,6 +3037,8 @@ void loop() {
     if (retryES100Initialization()) {
         updateDisplay();  // Update display to show ES100 is now available
     }
+
+    processDS3231SquareWave();
 
     // Handle ES100 interrupts
     if (es100InterruptFlag) {

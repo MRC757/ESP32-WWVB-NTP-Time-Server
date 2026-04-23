@@ -129,6 +129,11 @@
 // Touch panel interrupt — handled by LilyGo library
 #define PIN_TOUCH_INT       21
 
+// DS3231 1 Hz square-wave output.
+// Set this to the ESP32 GPIO wired to the DS3231 SQW/INT pin to discipline
+// NTP sub-second phase from the RTC. Leave at -1 to disable the feature.
+#define PIN_DS3231_SQW      39
+
 // ============================================================================
 // ES100 ANTENNA CONFIGURATION
 // ============================================================================

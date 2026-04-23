@@ -17,7 +17,8 @@ TimeManager::TimeManager()
     : _year(2000), _month(1), _day(1), 
       _hour(0), _minute(0), _second(0),
       _lastTickMillis(0), _syncMillis(0), 
-      _timeSet(false), _accumMillis(0) {
+      _timeSet(false), _accumMillis(0),
+      _rtcPhaseLocked(false), _rtcAnchorUnixSecond(0), _rtcAnchorMicros(0) {
 }
 
 // ============================================================================
@@ -35,6 +36,7 @@ void TimeManager::setTime(uint16_t year, uint8_t month, uint8_t day,
     _lastTickMillis = millis();
     _syncMillis = _lastTickMillis;
     _accumMillis = 0;
+    _rtcPhaseLocked = false;
     _timeSet = true;
     
     Serial.printf("TimeManager: Time set to %04d-%02d-%02d %02d:%02d:%02d UTC\n",
@@ -81,6 +83,7 @@ void TimeManager::setUnixTime(uint32_t unixTime) {
 void TimeManager::setSubSecondOffset(uint16_t ms) {
     if (ms >= 1000) ms = ms % 1000;
     _accumMillis = ms;
+    _rtcPhaseLocked = false;
     // _lastTickMillis intentionally not touched — tick() will advance from here.
 }
 
@@ -110,14 +113,47 @@ void TimeManager::setUnixTimePreserveMillis(uint32_t unixTime) {
     seconds %= 3600;
     _minute = seconds / 60;
     _second = seconds % 60;
+    if (_rtcPhaseLocked) {
+        uint32_t elapsedUs = micros() - _rtcAnchorMicros;
+        _rtcAnchorUnixSecond = unixTime - (elapsedUs / 1000000UL);
+    }
     // _accumMillis and _lastTickMillis intentionally NOT touched —
     // sub-second phase is preserved from the last full sync.
+}
+
+void TimeManager::setRTCPhaseAnchor(uint32_t unixSecond, uint32_t edgeMicros) {
+    ClockTime dt = unixToClockTime(unixSecond);
+    _year   = dt.year;
+    _month  = dt.month;
+    _day    = dt.day;
+    _hour   = dt.hour;
+    _minute = dt.minute;
+    _second = dt.second;
+
+    _rtcAnchorUnixSecond = unixSecond;
+    _rtcAnchorMicros = edgeMicros;
+    _rtcPhaseLocked = true;
+    _timeSet = true;
+}
+
+void TimeManager::clearRTCPhaseAnchor() {
+    _rtcPhaseLocked = false;
+    _lastTickMillis = millis();
+    _accumMillis = 0;
+}
+
+bool TimeManager::hasRTCPhaseAnchor() const {
+    return _rtcPhaseLocked;
 }
 
 // ============================================================================
 // Time Retrieval
 // ============================================================================
 ClockTime TimeManager::getUTCTime() {
+    if (_rtcPhaseLocked) {
+        return unixToClockTime(getUnixTime());
+    }
+
     ClockTime dt;
     dt.year   = _year;
     dt.month  = _month;
@@ -210,6 +246,11 @@ ClockTime TimeManager::getLocalTime(int8_t utcOffset, bool dst) {
 }
 
 uint32_t TimeManager::getUnixTime() {
+    if (_rtcPhaseLocked) {
+        uint32_t elapsedUs = micros() - _rtcAnchorMicros;
+        return _rtcAnchorUnixSecond + (elapsedUs / 1000000UL);
+    }
+
     uint32_t unixTime = 0;
 
     // Add years since 1970
@@ -241,6 +282,10 @@ uint32_t TimeManager::getUnixTime() {
 
 uint16_t TimeManager::getMilliseconds() {
     if (!_timeSet) return 0;
+    if (_rtcPhaseLocked) {
+        uint32_t elapsedUs = micros() - _rtcAnchorMicros;
+        return (uint16_t)((elapsedUs % 1000000UL) / 1000UL);
+    }
     unsigned long elapsed = millis() - _lastTickMillis;
     return (uint16_t)((_accumMillis + elapsed) % 1000);
 }
@@ -271,6 +316,7 @@ uint32_t TimeManager::getSecondsSinceSync() {
 // ============================================================================
 void TimeManager::tick() {
     if (!_timeSet) return;
+    if (_rtcPhaseLocked) return;
     
     unsigned long currentMillis = millis();
     unsigned long elapsed = currentMillis - _lastTickMillis;
@@ -355,6 +401,37 @@ uint8_t TimeManager::daysInMonth(uint16_t year, uint8_t month) {
     }
     
     return days;
+}
+
+ClockTime TimeManager::unixToClockTime(uint32_t unixTime) {
+    ClockTime dt;
+    uint32_t seconds = unixTime;
+    uint16_t year = 1970;
+
+    while (true) {
+        uint32_t secondsInYear = isLeapYear(year) ? 366UL * 86400UL : 365UL * 86400UL;
+        if (seconds < secondsInYear) break;
+        seconds -= secondsInYear;
+        year++;
+    }
+
+    uint8_t month = 1;
+    while (month <= 12) {
+        uint32_t secondsInMonth = (uint32_t)daysInMonth(year, month) * 86400UL;
+        if (seconds < secondsInMonth) break;
+        seconds -= secondsInMonth;
+        month++;
+    }
+
+    dt.year   = year;
+    dt.month  = month;
+    dt.day    = 1 + (seconds / 86400UL);
+    seconds  %= 86400UL;
+    dt.hour   = seconds / 3600UL;
+    seconds  %= 3600UL;
+    dt.minute = seconds / 60UL;
+    dt.second = seconds % 60UL;
+    return dt;
 }
 
 // ============================================================================

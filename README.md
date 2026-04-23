@@ -18,6 +18,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 ### Time Synchronization
 - **Atomic Time via WWVB**: Receives the NIST 60 kHz WWVB time signal for precise timekeeping
 - **DS3231 RTC Backup**: Hardware real-time clock holds time through power cycles; loaded at boot before first WWVB sync
+- **DS3231 1 Hz Phase Discipline**: The DS3231 `SQW/INT` output is wired to `GPIO39` and used as the second-boundary reference for NTP sub-second phase
 - **NTP Sync**: If WiFi is connected, can also sync to NTP as a secondary time source
 - **Time Source Priority**: WWVB > NTP > RTC > none; displayed on the UTC info page
 - **Automatic DST Handling**: Uses DST data from the ES100 signal; adjustable in config
@@ -26,7 +27,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Nightly Normal-Mode Anchor**: Tracking mode cannot self-correct clock errors larger than the ES100's ±4 s timing tolerance — once the clock drifts outside that window, each tracking sync perpetuates rather than corrects the error. To prevent this, the firmware forces a full normal-mode sync at the start of each night (10 PM local) and retries every hour until one succeeds. After a successful full-frame decode, tracking mode resumes for the rest of the night.
 - **Leap Second Detection**: The WWVB signal carries a leap second warning in the week(s) before a scheduled UTC adjustment. The firmware extracts this from the ES100 Status 0 register (bits 3:4) and displays it on the web dashboard.
 - **Antenna Performance Tracking**: Per-antenna success counts are accumulated across reboots (NVS). Both normal-mode and tracking-mode syncs automatically use the antenna with the higher historical success count.
-- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a floor-divided integer seconds plus a sub-second remainder during normal-mode WWVB syncs — `delaySeconds = irqProcessingDelay / 1000`, `subSec = irqProcessingDelay % 1000`. An earlier round-to-nearest formula (`(irqProcessingDelay + 500) / 1000`) caused a +1 s set-point error whenever the main loop was delayed ≥ 500 ms (e.g., during heavy NTP traffic): the rounded-up second was applied by `setUnixTime`, then `setSubSecondOffset` added the full fractional part again, totalling `1000 + frac` ms instead of the correct `frac` ms. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. After setting the integer second, the sub-second accumulator is immediately restored to the IRQ latency value so that NTP fractional timestamps remain stable between sync events. NTP client syncs combine the server's T3 sub-second fraction and half the measured RTT (`totalMs = T3_ms + rttMs/2`) before splitting into integer seconds and milliseconds — this correctly handles the carry when `totalMs ≥ 1000 ms` and prevents a 1-second set-point error that occurred when T3 was late in its second. The NTP server's transmit timestamp (T3) is re-sampled atomically at send time rather than reusing the receive-time integer second, eliminating a ~1 s error that appeared when a second boundary crossed between receive and transmit. `TimeManager::getUnixTime()` accounts for milliseconds elapsed since the last `tick()` call so that NTP timestamps are never stale by up to one full second between 1 Hz display updates. `TimeManager::getUTCTime()` applies the same carry logic so the physical display advances at the same instant the NTP timestamps cross the second boundary — eliminating a ≤1 s lag where the display showed N while NTP reported N+1.
+- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a floor-divided integer seconds plus a sub-second remainder during normal-mode WWVB syncs — `delaySeconds = irqProcessingDelay / 1000`, `subSec = irqProcessingDelay % 1000`. An earlier round-to-nearest formula (`(irqProcessingDelay + 500) / 1000`) caused a +1 s set-point error whenever the main loop was delayed ≥ 500 ms (e.g., during heavy NTP traffic): the rounded-up second was applied by `setUnixTime`, then `setSubSecondOffset` added the full fractional part again, totalling `1000 + frac` ms instead of the correct `frac` ms. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. After setting the integer second, the sub-second accumulator is immediately restored to the IRQ latency value so that NTP fractional timestamps remain stable between sync events. NTP client syncs combine the server's T3 sub-second fraction and half the measured RTT (`totalMs = T3_ms + rttMs/2`) before splitting into integer seconds and milliseconds — this correctly handles the carry when `totalMs ≥ 1000 ms` and prevents a 1-second set-point error that occurred when T3 was late in its second. The NTP server's transmit timestamp (T3) is re-sampled atomically at send time rather than reusing the receive-time integer second, eliminating a ~1 s error that appeared when a second boundary crossed between receive and transmit. When the DS3231 square wave is connected, each 1 Hz edge re-anchors `TimeManager` so the NTP sub-second phase is disciplined by the RTC instead of drifting on the ESP32 `millis()` clock.
 
 ### Display & Touch Interface
 - **Touch Navigation**: Swipe left/right to move between 5 pages; long-press 10 s to shut down
@@ -74,6 +75,7 @@ The ES100 chip requires an external 16 MHz crystal for its internal oscillator. 
 | GND | GND | |
 | SDA | GPIO3 | STEMMA QT connector |
 | SCL | GPIO2 | STEMMA QT connector |
+| SQW/INT | GPIO39 | 1 Hz square wave for RTC-disciplined NTP phase |
 
 The touch panel and PMU are connected to this same bus by the LilyGo board internally.
 
@@ -212,6 +214,7 @@ Pins are documented in `config.h` for reference and defined as local constants i
 | ES100 EN | 40 | — |
 | ES100 IRQ | 41 | — |
 | Touch INT | 21 | — |
+| DS3231 SQW/INT | 39 | 1 Hz interrupt input |
 
 ## Operation
 
@@ -221,8 +224,9 @@ Pins are documented in `config.h` for reference and defined as local constants i
 2. DS3231 RTC checked — if present, time is loaded from RTC immediately
 3. Saved WiFi credentials loaded; connection attempt begins if credentials exist
 4. On Wi-Fi connect: NTP sync runs automatically if time source is RTC or None (validates DS3231 set-point before WWVB arrives)
-5. ES100 detected and verified on Wire1 (bus 1, isolated); first WWVB sync attempt starts
-6. Clock displays running time from the best available source
+5. DS3231 `SQW/INT` is configured for 1 Hz output on `GPIO39`; each detected edge re-anchors the internal phase clock
+6. ES100 detected and verified on Wire1 (bus 1, isolated); first WWVB sync attempt starts
+7. Clock displays running time from the best available source
 
 ### Touch Interface
 
@@ -260,6 +264,7 @@ Once connected to WiFi:
 When the clock has a valid time and WiFi is connected, it acts as a **Stratum 1 NTP server**:
 - UDP port 123, RFC 5905 compliant
 - Responds only to client (mode 3) and symmetric-active (mode 1) requests
+- NTP transmit timestamps use the DS3231 1 Hz square wave on `GPIO39` as the sub-second phase reference when available
 
 **Stratum transitions:**
 
@@ -387,6 +392,8 @@ The bar chart shows successful WWVB receptions over the past 48 hours:
 ### Clock drifting between syncs
 
 The ESP32-S3 crystal has ~20 ppm accuracy. A **genuine DS3231** (Maxim/Analog Devices) has ~2 ppm with temperature compensation, providing much better holdover between WWVB syncs.
+
+With the DS3231 `SQW/INT` output wired to `GPIO39`, the NTP server no longer free-runs its sub-second phase on the ESP32 clock alone. Whole seconds come from WWVB/NTP/RTC sync state, and the DS3231 1 Hz edge continuously re-anchors the fractional phase used in NTP responses.
 
 **Clone DS3231 modules are a known problem.** Cheap breakout boards from Amazon/AliExpress (HiLetgo, etc.) frequently pair the DS3231 die with an off-spec or aged crystal, resulting in 30–70 ppm drift — 15–35× outside spec. Symptoms:
 

@@ -8,6 +8,7 @@
 #define TIMEMANAGER_H
 
 #include <Arduino.h>
+#include <stdint.h>
 
 // ============================================================================
 // Data Structures
@@ -117,6 +118,27 @@ public:
      */
     void setSubSecondOffset(uint16_t ms);
 
+    /**
+     * @brief Lock the timebase to an external second-boundary anchor.
+     * @details The supplied unixSecond is the UTC second that began at edgeMicros.
+     *          Subsequent reads derive both whole seconds and sub-second phase from
+     *          the elapsed microseconds since that anchor instead of free-running
+     *          solely on millis().
+     * @param unixSecond UTC second at the boundary
+     * @param edgeMicros micros() captured at that second boundary
+     */
+    void setRTCPhaseAnchor(uint32_t unixSecond, uint32_t edgeMicros);
+
+    /**
+     * @brief Clear any external phase lock and fall back to millis()-based holdover.
+     */
+    void clearRTCPhaseAnchor();
+
+    /**
+     * @brief True when the clock is currently disciplined by an external second edge.
+     */
+    bool hasRTCPhaseAnchor() const;
+
     
     /**
      * @brief Check if time has been set (synced at least once)
@@ -170,6 +192,11 @@ private:
     
     // Accumulated milliseconds for sub-second accuracy
     uint32_t _accumMillis;   // uint32 prevents overflow up to ~49 days
+
+    // Optional RTC-disciplined phase anchor
+    bool _rtcPhaseLocked;
+    uint32_t _rtcAnchorUnixSecond;
+    uint32_t _rtcAnchorMicros;
     
     /**
      * @brief Increment internal time by one second
@@ -186,6 +213,11 @@ private:
      * @param hours Hours to add (positive or negative)
      */
     void addHours(int8_t hours);
+
+    /**
+     * @brief Convert Unix seconds to calendar fields.
+     */
+    static ClockTime unixToClockTime(uint32_t unixTime);
 };
 
 #endif // TIMEMANAGER_H
