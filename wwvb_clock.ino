@@ -112,6 +112,7 @@ volatile bool rtcSqwInterruptFlag = false;
 volatile uint32_t rtcSqwEdgeMicros = 0;
 unsigned long lastRtcSqwSeenMillis = 0;
 unsigned long lastRtcSqwStatusLogMillis = 0;
+bool rtcWritePending = false;
 
 // Low battery tracking
 bool lowBatteryAlerted = false;         // True once 10% alert has been triggered
@@ -2134,6 +2135,10 @@ void saveTimeToDS3231() {
         return;
     }
 
+#if PIN_DS3231_SQW >= 0
+    rtcWritePending = true;
+    Serial.println("Queued DS3231 update for next 1Hz boundary");
+#else
     ClockTime utc = timeManager.getUTCTime();
     rtc.adjust(DateTime(utc.year, utc.month, utc.day,
                        utc.hour, utc.minute, utc.second));
@@ -2141,6 +2146,7 @@ void saveTimeToDS3231() {
     Serial.printf("Saved time to DS3231: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
                  utc.year, utc.month, utc.day,
                  utc.hour, utc.minute, utc.second);
+#endif
 }
 
 void syncFromDS3231() {
@@ -2200,26 +2206,68 @@ void processDS3231SquareWave() {
     rtcSqwInterruptFlag = false;
     interrupts();
 
-    if (!rtcAvailable) {
-        return;
-    }
-
-    DateTime rtcTime = rtc.now();
-    if (rtcTime.year() < 2025 || rtcTime.year() > 2100) {
-        return;
-    }
-
     bool wasLocked = timeManager.hasRTCPhaseAnchor();
-    timeManager.setRTCPhaseAnchor(rtcTime.unixtime(), edgeMicros);
+    uint32_t anchorUnix = 0;
+
+    if (rtcWritePending) {
+        anchorUnix = timeManager.getUnixTime();
+        if (timeManager.getMilliseconds() > 0) {
+            anchorUnix++;
+        }
+        ClockTime utc;
+        {
+            uint32_t seconds = anchorUnix;
+            uint16_t year = 1970;
+            while (true) {
+                uint32_t secondsInYear = TimeManager::isLeapYear(year) ? 366UL * 86400UL : 365UL * 86400UL;
+                if (seconds < secondsInYear) break;
+                seconds -= secondsInYear;
+                year++;
+            }
+            uint8_t month = 1;
+            while (month <= 12) {
+                uint32_t secondsInMonth = (uint32_t)TimeManager::daysInMonth(year, month) * 86400UL;
+                if (seconds < secondsInMonth) break;
+                seconds -= secondsInMonth;
+                month++;
+            }
+            utc.year   = year;
+            utc.month  = month;
+            utc.day    = 1 + (seconds / 86400UL);
+            seconds   %= 86400UL;
+            utc.hour   = seconds / 3600UL;
+            seconds   %= 3600UL;
+            utc.minute = seconds / 60UL;
+            utc.second = seconds % 60UL;
+        }
+        rtc.adjust(DateTime(utc.year, utc.month, utc.day,
+                           utc.hour, utc.minute, utc.second));
+        rtcWritePending = false;
+        Serial.printf("Saved time to DS3231 on 1Hz boundary: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+                     utc.year, utc.month, utc.day,
+                     utc.hour, utc.minute, utc.second);
+    } else {
+        if (!rtcAvailable) {
+            return;
+        }
+
+        DateTime rtcTime = rtc.now();
+        if (rtcTime.year() < 2025 || rtcTime.year() > 2100) {
+            return;
+        }
+        anchorUnix = rtcTime.unixtime();
+    }
+
+    timeManager.setRTCPhaseAnchor(anchorUnix, edgeMicros);
     lastRtcSqwSeenMillis = millis();
     if (!wasLocked) {
         Serial.printf("[RTC-SQW] lock acquired: unix=%lu micros=%lu\n",
-                      (unsigned long)rtcTime.unixtime(),
+                      (unsigned long)anchorUnix,
                       (unsigned long)edgeMicros);
         lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
     } else if ((lastRtcSqwSeenMillis - lastRtcSqwStatusLogMillis) >= 60000UL) {
         Serial.printf("[RTC-SQW] edge ok: unix=%lu micros=%lu\n",
-                      (unsigned long)rtcTime.unixtime(),
+                      (unsigned long)anchorUnix,
                       (unsigned long)edgeMicros);
         lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
     }
