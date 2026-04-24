@@ -113,6 +113,8 @@ volatile uint32_t rtcSqwEdgeMicros = 0;
 unsigned long lastRtcSqwSeenMillis = 0;
 unsigned long lastRtcSqwStatusLogMillis = 0;
 bool rtcWritePending = false;
+bool rtcWriteDonePending = false;   // true for one SQW edge after DS3231 write
+uint16_t rtcWriteSubsecMs = 0;     // milliseconds into current second at write time
 
 // Low battery tracking
 bool lowBatteryAlerted = false;         // True once 10% alert has been triggered
@@ -2211,9 +2213,11 @@ void processDS3231SquareWave() {
 
     if (rtcWritePending) {
         anchorUnix = timeManager.getUnixTime();
-        if (timeManager.getMilliseconds() > 0) {
-            anchorUnix++;
-        }
+        rtcWriteSubsecMs = timeManager.getMilliseconds();  // save phase for next edge
+        // Write the current integer second to DS3231.  The DS3231 oscillator resets
+        // at the write moment; the next SQW edge fires ~1 s later at anchorUnix+1,
+        // offset by rtcWriteSubsecMs from the true second boundary.  We correct for
+        // that offset in the rtcWriteDonePending handler below.
         ClockTime utc;
         {
             uint32_t seconds = anchorUnix;
@@ -2243,13 +2247,28 @@ void processDS3231SquareWave() {
         rtc.adjust(DateTime(utc.year, utc.month, utc.day,
                            utc.hour, utc.minute, utc.second));
         rtcWritePending = false;
-        Serial.printf("Saved time to DS3231 on 1Hz boundary: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+        rtcWriteDonePending = true;  // next edge uses phase-corrected anchor
+        Serial.printf("Saved time to DS3231 on 1Hz boundary: %04d-%02d-%02d %02d:%02d:%02d UTC (subsec=%ums)\n",
                      utc.year, utc.month, utc.day,
-                     utc.hour, utc.minute, utc.second);
-        // The rtc.adjust() write resets the DS3231 oscillator phase — this SQW edge
-        // belongs to the old oscillator boundary, not to anchorUnix.  Skip the phase
-        // anchor here; the next natural SQW edge (≤1 s away) will re-lock using
-        // rtc.now() from the freshly-written DS3231, giving the correct anchor.
+                     utc.hour, utc.minute, utc.second, rtcWriteSubsecMs);
+        return;
+    } else if (rtcWriteDonePending) {
+        // First natural SQW edge after a DS3231 write.  The DS3231 oscillator was
+        // reset at write time T.rtcWriteSubsecMs, so this edge fires at T+1.rtcWriteSubsecMs.
+        // rtc.now() correctly returns T+1; back-date the anchor micros by rtcWriteSubsecMs
+        // so the phase-locked clock shows T+1.rtcWriteSubsecMs at this edge — matching
+        // the TimeManager's sub-second phase from the WWVB sync that triggered the write.
+        rtcWriteDonePending = false;
+        if (!rtcAvailable) return;
+        DateTime rtcTime = rtc.now();
+        if (rtcTime.year() < 2025 || rtcTime.year() > 2100) return;
+        anchorUnix = rtcTime.unixtime();
+        timeManager.setRTCPhaseAnchor(anchorUnix,
+                                      edgeMicros - (uint32_t)rtcWriteSubsecMs * 1000UL);
+        lastRtcSqwSeenMillis = millis();
+        Serial.printf("[RTC-SQW] write-edge re-lock: unix=%lu subsec=%ums anchor_micros=%lu\n",
+                     (unsigned long)anchorUnix, rtcWriteSubsecMs,
+                     (unsigned long)(edgeMicros - (uint32_t)rtcWriteSubsecMs * 1000UL));
         return;
     } else {
         if (!rtcAvailable) {

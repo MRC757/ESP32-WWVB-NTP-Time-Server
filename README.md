@@ -19,7 +19,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Atomic Time via WWVB**: Receives the NIST 60 kHz WWVB time signal for precise timekeeping
 - **DS3231 RTC Backup**: Hardware real-time clock holds time through power cycles; loaded at boot before first WWVB sync
 - **DS3231 1 Hz Phase Discipline**: The DS3231 `SQW/INT` output is wired to `GPIO39` and used as the second-boundary reference for NTP sub-second phase
-- **Boundary-Aligned RTC Writes**: After NTP or WWVB updates, DS3231 writes are queued and applied on the next 1 Hz boundary so the RTC divider phase is aligned with UTC instead of being reset mid-second
+- **Boundary-Aligned RTC Writes**: After NTP or WWVB updates, DS3231 writes are queued and applied on the next 1 Hz boundary. The sub-second offset at write time is saved; on the first post-write SQW edge the phase anchor is back-dated by that offset, restoring the WWVB/NTP sync's fractional second with microsecond accuracy
 - **NTP Sync**: If WiFi is connected, can also sync to NTP as a secondary time source
 - **Time Source Priority**: WWVB > NTP > RTC > none; displayed on the UTC info page
 - **Automatic DST Handling**: Uses DST data from the ES100 signal; adjustable in config
@@ -395,7 +395,12 @@ The bar chart shows successful WWVB receptions over the past 48 hours:
 
 The ESP32-S3 crystal has ~20 ppm accuracy. A **genuine DS3231** (Maxim/Analog Devices) has ~2 ppm with temperature compensation, providing much better holdover between WWVB syncs.
 
-With the DS3231 `SQW/INT` output wired to `GPIO39`, the NTP server no longer free-runs its sub-second phase on the ESP32 clock alone. Whole seconds come from WWVB/NTP/RTC sync state, and the DS3231 1 Hz edge continuously re-anchors the fractional phase used in NTP responses. The RTC is also updated only on a controlled 1 Hz boundary, preventing mid-second `rtc.adjust()` writes from introducing a large fixed phase offset.
+With the DS3231 `SQW/INT` output wired to `GPIO39`, the NTP server no longer free-runs its sub-second phase on the ESP32 clock alone. Whole seconds come from WWVB/NTP/RTC sync state, and the DS3231 1 Hz edge continuously re-anchors the fractional phase used in NTP responses.
+
+RTC writes are queued and applied at the next 1 Hz boundary. The `rtc.adjust()` call resets the DS3231 oscillator phase; the firmware saves the sub-second offset at write time (`rtcWriteSubsecMs`) and on the following SQW edge back-dates the phase anchor by that value, fully restoring the WWVB/NTP sync's fractional second. Two bugs were found and fixed during development:
+
+- **+1 s jump after each sync** (fixed April 2026): `processDS3231SquareWave()` was calling `setRTCPhaseAnchor(M+1, currentEdge)` immediately after the write — anchoring second M+1 to the old oscillator's edge. Fixed by skipping the anchor on the write edge and waiting for the next natural edge.
+- **Sub-second phase loss after write** (fixed April 2026): the first post-write SQW edge fires at `T + subsecMs` past the true second boundary. Without correction, `rtc.now()` returns the integer second and the anchor is set `subsecMs` early, making the clock slow by that amount. Fixed by back-dating the anchor micros by `subsecMs × 1000 µs`.
 
 **Clone DS3231 modules are a known problem.** Cheap breakout boards from Amazon/AliExpress (HiLetgo, etc.) frequently pair the DS3231 die with an off-spec or aged crystal, resulting in 30–70 ppm drift — 15–35× outside spec. Symptoms:
 
@@ -467,17 +472,18 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 
 #### Real-World Accuracy Example
 
-Measured after DS3231 square-wave phase discipline and boundary-aligned RTC writes (April 22, 2026), with NTP as time source immediately after boot:
+Measured after all SQW phase-anchor fixes applied (April 24, 2026), with NTP as time source after boot:
 
 - `w32tm /stripchart /computer:192.168.0.243 /samples:5`
-- Sample offsets: `+0.016 s`, `+0.097 s`, `+0.001 s`, `+0.066 s`, `+0.048 s`
-- Sample delays: `+0.050 s` to `+0.240 s`
-- Result: the earlier fixed `~+0.8 s` server-side phase error is eliminated; remaining variation is consistent with WiFi / Windows client jitter
+- Sample offsets: `−0.021 s` to `−0.011 s` (PC within ~20 ms of WWVB NTP server)
+- time.gov browser reading: **−0.064 s** (64 ms, within browser measurement noise floor)
+- Result: sub-second phase fully restored after each sync; remaining variation is WiFi / Windows client jitter
 
-**Previous result before boundary-aligned RTC writes (same hardware, same DS3231 SQW discipline):**
+**Previous result — +1 s jump bug (before April 2026 fixes):**
 
-- `w32tm /stripchart` offsets were roughly `+0.79 s` to `+0.84 s`
-- Root cause: `rtc.adjust()` was occurring late in the second after NTP sync, resetting the DS3231 divider phase and making the square wave stable but wrong
+- After every WWVB or NTP sync, the clock jumped +1 s
+- Root cause: `setRTCPhaseAnchor(M+1, currentEdge)` was called on the same SQW edge as the `rtc.adjust()` write, anchoring one second in the future to a stale oscillator boundary
+- Combined with DS3231 drift of ~0.25 s over 1.5 h, produced a visible +1.25 s error vs time.gov after each hourly tracking sync
 
 **`w32tm /query /status` showed:**
 
