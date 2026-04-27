@@ -2282,17 +2282,22 @@ void processDS3231SquareWave() {
         anchorUnix = rtcTime.unixtime();
     }
 
-    timeManager.setRTCPhaseAnchor(anchorUnix, edgeMicros);
+    // Apply the same phase offset as the write-done handler: the DS3231 oscillator was
+    // reset at write time, so every SQW edge fires rtcWriteSubsecMs ms after the true
+    // second boundary until the next write.  Without this correction the phase established
+    // by the write-done handler is overwritten on E2 and all subsequent edges.
+    uint32_t correctedMicros = edgeMicros - (uint32_t)rtcWriteSubsecMs * 1000UL;
+    timeManager.setRTCPhaseAnchor(anchorUnix, correctedMicros);
     lastRtcSqwSeenMillis = millis();
     if (!wasLocked) {
-        Serial.printf("[RTC-SQW] lock acquired: unix=%lu micros=%lu\n",
+        Serial.printf("[RTC-SQW] lock acquired: unix=%lu micros=%lu (subsec=%ums)\n",
                       (unsigned long)anchorUnix,
-                      (unsigned long)edgeMicros);
+                      (unsigned long)correctedMicros, rtcWriteSubsecMs);
         lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
     } else if ((lastRtcSqwSeenMillis - lastRtcSqwStatusLogMillis) >= 60000UL) {
-        Serial.printf("[RTC-SQW] edge ok: unix=%lu micros=%lu\n",
+        Serial.printf("[RTC-SQW] edge ok: unix=%lu micros=%lu (subsec=%ums)\n",
                       (unsigned long)anchorUnix,
-                      (unsigned long)edgeMicros);
+                      (unsigned long)correctedMicros, rtcWriteSubsecMs);
         lastRtcSqwStatusLogMillis = lastRtcSqwSeenMillis;
     }
 #endif

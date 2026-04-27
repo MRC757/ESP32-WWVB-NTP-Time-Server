@@ -397,10 +397,11 @@ The ESP32-S3 crystal has ~20 ppm accuracy. A **genuine DS3231** (Maxim/Analog De
 
 With the DS3231 `SQW/INT` output wired to `GPIO39`, the NTP server no longer free-runs its sub-second phase on the ESP32 clock alone. Whole seconds come from WWVB/NTP/RTC sync state, and the DS3231 1 Hz edge continuously re-anchors the fractional phase used in NTP responses.
 
-RTC writes are queued and applied at the next 1 Hz boundary. The `rtc.adjust()` call resets the DS3231 oscillator phase; the firmware saves the sub-second offset at write time (`rtcWriteSubsecMs`) and on the following SQW edge back-dates the phase anchor by that value, fully restoring the WWVB/NTP sync's fractional second. Two bugs were found and fixed during development:
+RTC writes are queued and applied at the next 1 Hz boundary. The `rtc.adjust()` call resets the DS3231 oscillator phase; the firmware saves the sub-second offset at write time (`rtcWriteSubsecMs`) and on the following SQW edge back-dates the phase anchor by that value, fully restoring the WWVB/NTP sync's fractional second. Three bugs were found and fixed during development:
 
 - **+1 s jump after each sync** (fixed April 2026): `processDS3231SquareWave()` was calling `setRTCPhaseAnchor(M+1, currentEdge)` immediately after the write — anchoring second M+1 to the old oscillator's edge. Fixed by skipping the anchor on the write edge and waiting for the next natural edge.
 - **Sub-second phase loss after write** (fixed April 2026): the first post-write SQW edge fires at `T + subsecMs` past the true second boundary. Without correction, `rtc.now()` returns the integer second and the anchor is set `subsecMs` early, making the clock slow by that amount. Fixed by back-dating the anchor micros by `subsecMs × 1000 µs`.
+- **Phase correction dropped after first post-write edge** (fixed April 2026): the write-done handler correctly back-dates the anchor on edge E1, but the DS3231 SQW remains `rtcWriteSubsecMs` late relative to the true second boundary on every subsequent edge until the next write. The normal edge handler was using raw `edgeMicros` (no correction), overwriting the E1 anchor and leaving the clock permanently slow by `rtcWriteSubsecMs` (up to ~500 ms). Fixed by applying `edgeMicros − rtcWriteSubsecMs × 1000 µs` on every normal SQW edge, not just E1.
 
 **Clone DS3231 modules are a known problem.** Cheap breakout boards from Amazon/AliExpress (HiLetgo, etc.) frequently pair the DS3231 die with an off-spec or aged crystal, resulting in 30–70 ppm drift — 15–35× outside spec. Symptoms:
 
@@ -472,12 +473,18 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 
 #### Real-World Accuracy Example
 
-Measured after all SQW phase-anchor fixes applied (April 24, 2026), with NTP as time source after boot:
+Measured after all SQW phase-anchor fixes applied (April 27, 2026), after WWVB tracking sync as time source:
 
 - `w32tm /stripchart /computer:192.168.0.243 /samples:5`
-- Sample offsets: `−0.021 s` to `−0.011 s` (PC within ~20 ms of WWVB NTP server)
-- time.gov browser reading: **−0.064 s** (64 ms, within browser measurement noise floor)
-- Result: sub-second phase fully restored after each sync; remaining variation is WiFi / Windows client jitter
+- Sample offsets: `−0.063 s` to `−0.015 s` (variation due to WiFi asymmetry)
+- time.gov browser reading: **−0.007 s** (7 ms) immediately after re-sync
+- Result: sub-second phase fully maintained across SQW edges; remaining variation is WiFi / Windows client jitter
+
+**Previous result — phase correction dropped on E2+ bug (before April 27, 2026 fix):**
+
+- After each WWVB or NTP sync, the clock drifted to approximately `−rtcWriteSubsecMs` ms (up to ~500 ms slow) and held that offset until the next sync
+- Root cause: the write-done handler (E1) correctly back-dated the phase anchor, but the normal edge handler (E2+) overwrote it with raw `edgeMicros`, losing the correction on every subsequent edge
+- Observed: −441 ms error vs time.gov, stable across 83 minutes of DS3231 holdover — exactly matching `rtcWriteSubsecMs` captured at the prior sync's DS3231 write
 
 **Previous result — +1 s jump bug (before April 2026 fixes):**
 
