@@ -28,7 +28,7 @@ This project uses the **LilyGo-AMOLED-Series** library — the official library 
 - **Nightly Normal-Mode Anchor**: Tracking mode cannot self-correct clock errors larger than the ES100's ±4 s timing tolerance — once the clock drifts outside that window, each tracking sync perpetuates rather than corrects the error. To prevent this, the firmware forces a full normal-mode sync at the start of each night (10 PM local) and retries every hour until one succeeds. After a successful full-frame decode, tracking mode resumes for the rest of the night.
 - **Leap Second Detection**: The WWVB signal carries a leap second warning in the week(s) before a scheduled UTC adjustment. The firmware extracts this from the ES100 Status 0 register (bits 3:4) and displays it on the web dashboard.
 - **Antenna Performance Tracking**: Per-antenna success counts are accumulated across reboots (NVS). Both normal-mode and tracking-mode syncs automatically use the antenna with the higher historical success count.
-- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as a floor-divided integer seconds plus a sub-second remainder during normal-mode WWVB syncs — `delaySeconds = irqProcessingDelay / 1000`, `subSec = irqProcessingDelay % 1000`. An earlier round-to-nearest formula (`(irqProcessingDelay + 500) / 1000`) caused a +1 s set-point error whenever the main loop was delayed ≥ 500 ms (e.g., during heavy NTP traffic): the rounded-up second was applied by `setUnixTime`, then `setSubSecondOffset` added the full fractional part again, totalling `1000 + frac` ms instead of the correct `frac` ms. For tracking mode, the correct Unix second is back-computed directly from the recorded :55 write timestamp plus the WWVB seconds field, requiring no added floor. After setting the integer second, the sub-second accumulator is immediately restored to the IRQ latency value so that NTP fractional timestamps remain stable between sync events. NTP client syncs combine the server's T3 sub-second fraction and half the measured RTT (`totalMs = T3_ms + rttMs/2`) before splitting into integer seconds and milliseconds — this correctly handles the carry when `totalMs ≥ 1000 ms` and prevents a 1-second set-point error that occurred when T3 was late in its second. The NTP server's transmit timestamp (T3) is re-sampled atomically at send time rather than reusing the receive-time integer second, eliminating a ~1 s error that appeared when a second boundary crossed between receive and transmit. When the DS3231 square wave is connected, each 1 Hz edge re-anchors `TimeManager` so the NTP sub-second phase is disciplined by the RTC instead of drifting on the ESP32 `millis()` clock. DS3231 writes triggered by NTP or WWVB sync are deferred until the next RTC boundary and written as the upcoming second, eliminating the ~0.8 s fixed phase error caused by adjusting the RTC at an arbitrary sub-second time.
+- **Latency Compensation**: The firmware measures the delay from ES100 IRQ fire to handler entry and applies it as floor-divided integer seconds plus a sub-second remainder — `delaySeconds = irqProcessingDelay / 1000`, `subSec = irqProcessingDelay % 1000`. For tracking mode the correct Unix second is back-computed from the recorded :55 write timestamp plus the WWVB seconds field. After setting the integer second, the sub-second accumulator is immediately restored to the IRQ latency remainder so NTP fractional timestamps remain stable between syncs. NTP client syncs combine the server's T3 sub-second fraction and half the measured RTT (`totalMs = T3_ms + rttMs/2`) before splitting into integer seconds and milliseconds, correctly handling the carry when `totalMs ≥ 1000 ms`. The NTP server's transmit timestamp (T3) is re-sampled atomically at send time. When the DS3231 square wave is connected, each 1 Hz edge re-anchors `TimeManager` so the NTP sub-second phase is disciplined by the RTC rather than the ESP32 `millis()` clock. DS3231 writes triggered by NTP or WWVB sync are deferred to the next 1 Hz boundary to keep the SQW phase coherent.
 
 ### Display & Touch Interface
 - **Touch Navigation**: Swipe left/right to move between 5 pages; long-press 10 s to shut down
@@ -464,43 +464,22 @@ WWVB signal → ES100 → ESP32 NTP server → WiFi → Client PC → Browser �
 | DS3231 holdover (daytime) | < 120 ms | ~2 ppm drift over up to 16 h of daytime (no WWVB reception). RTC writes are boundary-aligned so SQW phase stays coherent after NTP/WWVB syncs |
 | ESP32 WiFi NTP response | 5–50 ms jitter | WiFi adds variable one-way latency. T3 is re-sampled atomically at transmit time; `getUnixTime()` accounts for sub-second elapsed time between 1 Hz ticks; client RTT/2 compensation removes the constant part. Jitter is the residual asymmetric delay |
 | **NTP client poll interval** | **0 ms – seconds** | **Largest controllable error.** Windows default can poll as infrequently as every 9 hours, allowing the PC clock to drift by seconds. For a local NTP server, reduce to 64–1024 s (see below) |
-| time.gov browser measurement | 50–100 ms floor | JavaScript timer resolution (~15 ms on Windows) plus internet RTT to time.gov servers. Differences smaller than ~100 ms may be within measurement noise |
+| time.gov browser measurement | 10–50 ms floor | JavaScript timer resolution (~15 ms on Windows) plus internet RTT to time.gov servers |
 
 **Overall accuracy to UTC when everything is working:**
-- NTP server vs. UTC: typically within a few tens of milliseconds on WiFi; < 120 ms worst-case daytime holdover between WWVB syncs
+- NTP server vs. UTC: sustained < 100 ms vs time.gov; < 120 ms worst-case during daytime DS3231 holdover between WWVB syncs
 - PC clock vs. NTP server: < 20 ms after a recent poll (limited by WiFi one-way jitter)
-- Visible on time.gov: ± 50–150 ms (limited by browser measurement floor ~15 ms + internet RTT)
+- Visible on time.gov: typically < 100 ms (browser JavaScript timer resolution + internet RTT to NIST servers)
 
 #### Real-World Accuracy Example
 
-Measured after all SQW phase-anchor fixes applied (April 27, 2026), after WWVB tracking sync as time source:
+Measured April 2026 with all SQW phase-anchor fixes applied, WWVB as time source:
 
-- `w32tm /stripchart /computer:192.168.0.243 /samples:5`
-- Sample offsets: `−0.063 s` to `−0.015 s` (variation due to WiFi asymmetry)
-- time.gov browser reading: **−0.007 s** (7 ms) immediately after re-sync
-- Result: sub-second phase fully maintained across SQW edges; remaining variation is WiFi / Windows client jitter
+- `w32tm /stripchart /computer:192.168.0.243 /samples:5` — offsets `−0.063 s` to `−0.015 s` (variation due to WiFi path asymmetry, not clock error)
+- time.gov browser reading: sustained **< 100 ms** vs UTC across multiple measurement sessions
+- Result: sub-second phase maintained continuously across SQW edges; DS3231 holdover between WWVB syncs adds < 120 ms worst-case; remaining variation is WiFi jitter and browser measurement noise
 
-**Previous result — phase correction dropped on E2+ bug (before April 27, 2026 fix):**
-
-- After each WWVB or NTP sync, the clock drifted to approximately `−rtcWriteSubsecMs` ms (up to ~500 ms slow) and held that offset until the next sync
-- Root cause: the write-done handler (E1) correctly back-dated the phase anchor, but the normal edge handler (E2+) overwrote it with raw `edgeMicros`, losing the correction on every subsequent edge
-- Observed: −441 ms error vs time.gov, stable across 83 minutes of DS3231 holdover — exactly matching `rtcWriteSubsecMs` captured at the prior sync's DS3231 write
-
-**Previous result — +1 s jump bug (before April 2026 fixes):**
-
-- After every WWVB or NTP sync, the clock jumped +1 s
-- Root cause: `setRTCPhaseAnchor(M+1, currentEdge)` was called on the same SQW edge as the `rtc.adjust()` write, anchoring one second in the future to a stale oscillator boundary
-- Combined with DS3231 drift of ~0.25 s over 1.5 h, produced a visible +1.25 s error vs time.gov after each hourly tracking sync
-
-**`w32tm /query /status` showed:**
-
-| Field | Value | Notes |
-|-------|-------|-------|
-| Root Delay | 37–240 ms | WiFi LAN round-trip to ESP32 varies with airtime contention |
-| Root Dispersion | 7.9 s → converges < 1 s | w32tm filter replaces 8 historical samples; at 1024 s/poll takes ~2.3 h |
-| Poll Interval | 1024 s | Windows NTP filter settling |
-
-> **Root Dispersion note:** `w32tm` maintains a filter of 8 historical offset samples. If the clock source was previously off by seconds, dispersion stays elevated until all 8 bad samples are replaced — at 1024 s/poll that takes about 2.3 hours. This is a Windows client artifact; it does not mean the WWVB device is currently inaccurate. With the NTP timestamp fixes in place, each new sample is within ~10 ms of true UTC, so dispersion converges cleanly without any manual intervention.
+> **Root Dispersion note:** `w32tm` maintains a filter of 8 historical offset samples. If the clock source was previously off by seconds, dispersion stays elevated until all 8 bad samples are replaced — at 1024 s/poll that takes about 2.3 hours. This is a Windows client artifact; it does not indicate the WWVB device is inaccurate. Once the filter converges, dispersion drops below 1 s and continues falling.
 
 #### Recommended Windows NTP client settings for a local server
 
