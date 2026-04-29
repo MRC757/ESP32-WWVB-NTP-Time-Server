@@ -2754,10 +2754,12 @@ void handleES100Interrupt() {
                     }
 
                     if (sanityOk) {
-                        timeManager.setUnixTime(corrected);
-                        // Restore sub-second phase: IRQ fired at the true second boundary;
-                        // irqProcessingDelay ms have elapsed since then.  Setting _accumMillis
-                        // to that value keeps the clock at corrected + delay, matching true time.
+                        // corrected = second at IRQ fire.  Add whole-second delay so the
+                        // clock lands at corrected + irqProcessingDelay, matching true time.
+                        // Without this, a 3–4 s main-loop stall (NTP traffic, display) drops
+                        // the whole-second part and leaves the clock 3–4 s behind.
+                        uint32_t delaySeconds = irqProcessingDelay / 1000UL;
+                        timeManager.setUnixTime(corrected + delaySeconds);
                         timeManager.setSubSecondOffset((uint16_t)(irqProcessingDelay % 1000));
                         syncOk = true;
                     }
