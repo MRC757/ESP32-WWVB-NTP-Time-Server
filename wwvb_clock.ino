@@ -182,6 +182,10 @@ int8_t selectedNetwork = -1;
 int8_t listScrollOffset = 0;
 unsigned long wifiConnectStart = 0;
 unsigned long lastWifiScan = 0;
+unsigned long wifiDisconnectMillis = 0;  // millis() when disconnect was detected
+unsigned long wifiIdleRetryMillis = 0;   // millis() for next IDLE retry attempt
+const unsigned long WIFI_RECONNECT_DELAY_MS = 5000;  // 5 second delay before reconnecting
+const unsigned long WIFI_IDLE_RETRY_INTERVAL_MS = 30000;  // Retry every 30s in IDLE with saved credentials
 String wifiErrorMsg = "";
 
 NTPServer ntpServer;
@@ -1071,6 +1075,8 @@ void wifiConnect(const String& ssid, const String& password) {
 void wifiCheckConnection() {
     if (WiFi.status() == WL_CONNECTED) {
         wifiState = WIFI_STATE_CONNECTED;
+        wifiDisconnectMillis = 0;  // Clear disconnect tracking on successful reconnect
+        wifiIdleRetryMillis = 0;   // Clear idle retry tracking
         wifiErrorMsg = "";
         Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -1229,16 +1235,34 @@ void wifiLoop() {
             wifiCheckConnection();
             break;
         case WIFI_STATE_CONNECTED:
-            // Check for disconnect — auto-reconnect with saved credentials
+            // Check for disconnect — auto-reconnect with saved credentials (non-blocking)
             if (WiFi.status() != WL_CONNECTED) {
-                Serial.println("[WIFI] Connection lost, reconnecting in 5s...");
-                ntpServer.stop();
-                statusServer.stop();
-                delay(5000);  // Brief delay before reconnect to let the AP stabilize
-                if (wifiSSID.length() > 0) {
+                if (wifiDisconnectMillis == 0) {
+                    // First detection of disconnect
+                    Serial.println("[WIFI] Connection lost, scheduling reconnect...");
+                    ntpServer.stop();
+                    statusServer.stop();
+                    wifiDisconnectMillis = millis();
+                }
+
+                // Wait for reconnect delay before attempting to reconnect
+                if (millis() - wifiDisconnectMillis >= WIFI_RECONNECT_DELAY_MS) {
+                    wifiDisconnectMillis = 0;  // Reset for next disconnect
+                    if (wifiSSID.length() > 0) {
+                        wifiConnect(wifiSSID, wifiPassword);
+                    } else {
+                        wifiState = WIFI_STATE_IDLE;
+                    }
+                }
+            }
+            break;
+        case WIFI_STATE_IDLE:
+            // Periodically retry connection if credentials are saved
+            if (wifiSSID.length() > 0) {
+                if (wifiIdleRetryMillis == 0 || millis() - wifiIdleRetryMillis >= WIFI_IDLE_RETRY_INTERVAL_MS) {
+                    wifiIdleRetryMillis = millis();
+                    Serial.println("[WIFI] Attempting reconnect from IDLE with saved credentials...");
                     wifiConnect(wifiSSID, wifiPassword);
-                } else {
-                    wifiState = WIFI_STATE_IDLE;
                 }
             }
             break;
