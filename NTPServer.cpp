@@ -186,9 +186,15 @@ void NTPServer::buildResponse(const uint8_t* request, uint8_t* response) {
     // Copy bytes 40-47 from the request
     memcpy(&response[24], &request[40], 8);
 
-    // Bytes 32-39: Receive Timestamp (when we received the request)
-    writeUint32(&response[32], ntpNow);      // Seconds
-    writeUint32(&response[36], ntpFraction);  // Fraction (~1ms resolution)
+    // Bytes 32-39: Receive Timestamp — re-sample atomically before writing.
+    // Must NOT reuse the stale unixNow/ntpFraction from the beginning of this function:
+    // if processing above takes >1s, the timestamp becomes stale and NTP clients will
+    // compensate by advancing their clocks by the processing delay, causing errors of 1-3s.
+    uint32_t rxUnix;
+    uint16_t rxMs;
+    _timeManager->getTimeSnapshot(rxUnix, rxMs);
+    writeUint32(&response[32], unixToNTP(rxUnix));
+    writeUint32(&response[36], (uint32_t)rxMs * 4294967UL);
 
     // Bytes 40-47: Transmit Timestamp — re-sample atomically at send time.
     // Must NOT reuse ntpNow (receive-time integer second): if a second boundary
